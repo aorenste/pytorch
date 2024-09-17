@@ -697,6 +697,20 @@ def _compile_fx_inner(
     return compiled_graph
 
 
+ggg = 42
+
+
+class MyClass:
+    @staticmethod
+    def myfn(value):
+        print(f"** in MyClass.myfn({value}), ggg={ggg}")
+        return 42
+
+
+def hack_compile(*args, **kwargs):
+    print("HACK COMPILE!:", repr(args), repr(kwargs))
+
+
 def fx_codegen_and_compile(
     gm: torch.fx.GraphModule,
     example_inputs: List[torch.Tensor],
@@ -713,11 +727,63 @@ def fx_codegen_and_compile(
     layout_opt: Optional[bool] = None,
     extern_node_serializer: Optional[Callable[[List[ExternKernelNode]], Any]] = None,
 ) -> Union[CompiledFxGraph, str]:
+    print("******** fx_codegen_and_compile STARTS HERE", file=sys.stderr)
+    try:
+        pool = torch._inductor.async_compile.AsyncCompile.process_pool()
+
+        start = time.time()
+        # f = pool.submit(fx_codegen_and_compile_, gm, example_inputs, cudagraphs, static_input_idxs, is_backward, graph_id, cpp_wrapper, aot_mode, is_inference, user_visible_outputs, layout_opt, extern_node_serializer)
+        # can't pickle: example_inputs
+        print("EXAMPLE INPUTS:", repr(example_inputs))
+        f = pool.submit(hack_compile, gm, example_inputs, cudagraphs, static_input_idxs, is_backward, graph_id, cpp_wrapper, aot_mode, is_inference, user_visible_outputs, layout_opt, extern_node_serializer)
+        last = time.time()
+        while not f.done():
+            time.sleep(0.001)
+            now = time.time()
+            if now - last > 1:
+                print("tick...")
+                last = now
+        aresult = f.result()
+        end = time.time()
+        print(f"*** ASYNC TOOK: {(end-start)*1000}ms")
+
+        # breakpoint()
+
+        start = time.time()
+        graph = fx_codegen_and_compile_(gm, example_inputs, cudagraphs, static_input_idxs, is_backward, graph_id, cpp_wrapper, aot_mode, is_inference, user_visible_outputs, layout_opt, extern_node_serializer)
+        end = time.time()
+        print(f"*** TOOK: {(end-start)*1000}ms")
+        return graph
+
+    finally:
+        print("******** fx_codegen_and_compile ENDS HERE", file=sys.stderr)
+
+
+def fx_codegen_and_compile_(
+    gm: torch.fx.GraphModule,
+    example_inputs: List[torch.Tensor],
+    cudagraphs: Optional[BoxedBool] = None,
+    static_input_idxs: Optional[List[int]] = None,
+    is_backward: bool = False,
+    graph_id: Optional[int] = None,
+    cpp_wrapper: bool = False,
+    aot_mode: bool = False,
+    is_inference: bool = False,
+    # Use a dict with None value rather than a set for deterministic
+    # iteration order just in case.
+    user_visible_outputs: Optional[Dict[str, None]] = None,
+    layout_opt: Optional[bool] = None,
+    extern_node_serializer: Optional[Callable[[List[ExternKernelNode]], Any]] = None,
+) -> Union[CompiledFxGraph, str]:
+    print("******** fx_codegen_and_compile_ STARTS HERE", file=sys.stderr)
     if (sleep_sec := config.sleep_sec_TESTING_ONLY) is not None:
         import time
 
         log.warning("Sleeping for %s since sleep_sec_TESTING_ONLY is set", sleep_sec)
         time.sleep(sleep_sec)
+
+
+    #breakpoint()
 
     with dynamo_utils.preserve_rng_state():
         if is_tf32_warning_applicable(gm):
@@ -931,6 +997,7 @@ def fx_codegen_and_compile(
                     counters["inductor"] - inductor_counters,
                 )
 
+        print("******** fx_codegen_and_compile_ ENDS HERE", file=sys.stderr)
         return compiled_graph
 
 

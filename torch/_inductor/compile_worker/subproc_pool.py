@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copyreg
 import functools
 import itertools
 import logging
 import multiprocessing
 import os
+import io
 import pickle
 import struct
 import subprocess
@@ -18,6 +20,7 @@ from typing import Any, Callable, Dict, Tuple, BinaryIO, TypeVar
 
 from torch._inductor import config
 from torch._inductor.compile_worker.watchdog import _async_compile_initializer
+from torch._subclasses.fake_tensor import FakeTensor, TensorMetadata
 
 
 log = logging.getLogger(__name__)
@@ -84,6 +87,39 @@ class SubprocException(Exception):
         super().__init__(f"An exception occurred in a subprocess:\n\n{details}")
 
 
+def _unpickle_fake_tensor(data: TensorMetadata) -> FakeTensor:
+    print("*** _unpickle_fake_tensor: ", data)
+    return None
+
+
+def _pickle_fake_tensor(t: FakeTensor) -> Tuple[Callable[[TensorMetadata], FakeTensor], Tuple[TensorMetadata]]:
+    # metadata = extract_tensor_metadata_for_cache_key(device_map, t)
+    return (_unpickle_fake_tensor, (b"brandnew",))
+
+
+class _SubprocPickler(pickle.Pickler):
+    dispatch_table = copyreg.dispatch_table.copy()
+    dispatch_table[FakeTensor] = _pickle_fake_tensor
+
+    @classmethod
+    def dumps(cls, obj: object) -> bytes:
+        """
+        Pickle an object.
+        """
+        with io.BytesIO() as stream:
+            pickler = cls(stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickler.dump(obj)
+            return stream.getvalue()
+
+
+class _SubprocUnpickler(pickle.Unpickler):
+    @classmethod
+    def loads(cls, data: bytes) -> object:
+        with io.BytesIO(data) as stream:
+            unpickler = cls(stream)
+            return unpickler.load()
+
+
 class SubprocPool:
     """
     Mimic a concurrent.futures.ProcessPoolExecutor, but wrap it in
@@ -137,7 +173,7 @@ class SubprocPool:
     def submit(self, job_fn: Callable[..., _T], *args: object) -> Future[_T]:
         if args:
             job_fn = functools.partial(job_fn, *args)
-        job_data = pickle.dumps(job_fn, pickle.HIGHEST_PROTOCOL)
+        job_data = _SubprocPickler.dumps(job_fn)
         future: Future[_T]
         with self.futures_lock:
             job_id = next(self.job_id_count)
@@ -158,7 +194,7 @@ class SubprocPool:
                         log.warning("SubprocPool unclean exit")
                     self.read_pipe.close()
                     return
-                result = pickle.loads(data)
+                result = _SubprocUnpickler.loads(data)
                 with self.futures_lock:
                     if not self.running:
                         return
@@ -256,7 +292,7 @@ class SubprocMain:
                 result = future.result()
             except Exception as e:
                 log.exception("Error in subprocess")
-                result = pickle.dumps(e, pickle.HIGHEST_PROTOCOL)
+                result = _SubprocPickler.dumps(e)
             assert isinstance(result, bytes)
             with self.write_lock:
                 if self.running:
@@ -268,12 +304,12 @@ class SubprocMain:
     @staticmethod
     def do_job(data: bytes) -> bytes:
         # do the pickle/unpickle in the sub-subproc
-        job = pickle.loads(data)
+        job = typing.cast(Callable[[], object], _SubprocUnpickler.loads(data))
         try:
             result = job()
         except Exception as e:
             result = _SubprocExceptionInfo(traceback.format_exc())
-        return pickle.dumps(result, pickle.HIGHEST_PROTOCOL)
+        return _SubprocPickler.dumps(result)
 
 
 AnyPool = typing.Union[ProcessPoolExecutor, SubprocPool]
