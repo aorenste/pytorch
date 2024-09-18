@@ -708,6 +708,7 @@ class MyClass:
 
 
 def hack_compile(*args, **kwargs):
+    # Need to set up a FakeTensorMode
     print("HACK COMPILE!:", repr(args), repr(kwargs))
 
 
@@ -728,6 +729,8 @@ def fx_codegen_and_compile(
     extern_node_serializer: Optional[Callable[[List[ExternKernelNode]], Any]] = None,
 ) -> Union[CompiledFxGraph, str]:
     print("******** fx_codegen_and_compile STARTS HERE", file=sys.stderr)
+    assert isinstance(torch.utils._python_dispatch._get_current_dispatch_mode(), FakeTensorMode)
+
     try:
         pool = torch._inductor.async_compile.AsyncCompile.process_pool()
 

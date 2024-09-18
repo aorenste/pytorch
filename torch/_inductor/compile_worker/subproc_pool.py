@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Tuple, BinaryIO, TypeVar
 
 from torch._inductor import config
 from torch._inductor.compile_worker.watchdog import _async_compile_initializer
-from torch._subclasses.fake_tensor import FakeTensor, TensorMetadata
+from torch._subclasses.fake_tensor import FakeTensor, TensorMetadata, extract_tensor_metadata
 
 
 log = logging.getLogger(__name__)
@@ -93,8 +93,12 @@ def _unpickle_fake_tensor(data: TensorMetadata) -> FakeTensor:
 
 
 def _pickle_fake_tensor(t: FakeTensor) -> Tuple[Callable[[TensorMetadata], FakeTensor], Tuple[TensorMetadata]]:
-    # metadata = extract_tensor_metadata_for_cache_key(device_map, t)
-    return (_unpickle_fake_tensor, (b"brandnew",))
+    # THINGS TO WORRY ABOUT:
+    # 1. Need to make sure that two tensors with the same id end up with the
+    #    same id on the other side of the wire.
+    # 2. SymExpr
+    metadata = extract_tensor_metadata(t)
+    return (_unpickle_fake_tensor, (metadata,))
 
 
 class _SubprocPickler(pickle.Pickler):
