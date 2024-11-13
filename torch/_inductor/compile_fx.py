@@ -1320,7 +1320,8 @@ def fx_codegen_and_compile(
                 raise BypassFxGraphCache("aot_mode not supported for async compile")
 
             # scheme = _DebugFileFxCompile()
-            scheme = _SubprocessFxCompile()
+            # scheme = _SubprocessFxCompile()
+            scheme = _DebugFxCompile()
         except BypassFxGraphCache as e:
             log.debug("Skipping async compile:", str(e))
 
