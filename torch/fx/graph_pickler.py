@@ -153,7 +153,16 @@ class _NodePickleData:
         self.type = node.type
         # self.sort_key = node._sort_key
         # self.repr_fn = node._repr_fn
-        # self.meta = node.meta
+        #xxx = {
+        #    k: v
+        #    for k, v in node.meta.items()
+        #    if k in ('tensor_meta', "val", "mutation_region_id", "from_node", "seq_nr", "source_fn_stack", "stack_trace", "original_aten")
+        #    # BAD: original_aten
+        #}
+        #if "original_aten" in node.meta:
+        #    assert isinstance(node.meta["original_aten"], torch._ops.OperatorBase)
+        #    # breakpoint()
+        #print("META skipped:", sorted(set(node.meta.keys()) - set(xxx.keys())))
         self.meta = node.meta
 
     def unpickle(
@@ -399,10 +408,13 @@ class _SubprocPickler(pickle.Pickler):
         """
         Pickle an object.
         """
+        print("*** _SubprocPickler dumps start")
         with io.BytesIO() as stream:
             pickler = cls(stream)
             pickler.dump(obj)
-            return stream.getvalue()
+            result = stream.getvalue()
+        print("*** _SubprocPickler dumps end")
+        return result
 
 
 class _UnpickleState:

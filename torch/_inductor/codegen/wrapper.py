@@ -392,6 +392,7 @@ class AllocateLine(MemoryPlanningLine):
     def codegen(self, code: IndentedBuffer) -> None:
         assert self.node.get_name() not in V.graph.removed_buffers
         line = self.wrapper.make_buffer_allocation(self.node)
+        print(f"*** LINE: {line}")
         code.writeline(line)
 
 
@@ -1011,6 +1012,7 @@ class PythonWrapperCodegen(CodeGen):
             return self._generate(is_inference)
 
     def _generate(self, is_inference):
+        breakpoint()
         if config.profile_bandwidth:
             self.write_triton_header_once()
         result = IndentedBuffer()
@@ -1041,41 +1043,53 @@ class PythonWrapperCodegen(CodeGen):
             if config.triton.store_cubin:
                 self.generate_reset_kernel_saved_flags()
 
+            print(f"LINE[2]: {self.lines[2]}")
+            breakpoint()
             for line in self.lines:
                 if isinstance(line, WrapperLine):
                     line.codegen(self.wrapper_call)
                 else:
                     self.wrapper_call.writeline(line)
+                print(f"POINT 0: LINE: {line}, {self.wrapper_call.getvaluewithlinemap()}")
 
             output_refs = self.get_output_refs()
             self.mark_output_type()
             if config.triton.debug_sync_graph:
                 self.wrapper_call.writeline(V.graph.device_ops.synchronize())
+            print(f"POINT A: WRAPPER: {self.wrapper_call.getvaluewithlinemap()}")
 
             if config.profile_bandwidth:
                 self.generate_end_graph()
 
+            #print(f"POINT B: WRAPPER: {self.wrapper_call.getvaluewithlinemap()}")
             if config.triton.store_cubin:
                 self.generate_save_uncompiled_kernels()
 
+            #print(f"POINT C: WRAPPER: {self.wrapper_call.getvaluewithlinemap()}")
             if config.triton.autotune_at_compile_time:
                 self.generate_and_run_autotune_block()
 
+            #print(f"POINT D: WRAPPER: {self.wrapper_call.getvaluewithlinemap()}")
             self.generate_return(output_refs)
 
+        #print(f"POINT E: WRAPPER: {self.wrapper_call.getvaluewithlinemap()}")
         self.finalize_prefix()
         result.splice(self.prefix)
 
+        print(f"POINT F: RESULT: {result.getvaluewithlinemap()}")
         with result.indent():
             result.splice(self.wrapper_call)
 
+        print(f"POINT G: RESULT: {result.getvaluewithlinemap()}")
         self.generate_before_suffix(result)
         result.splice(self.suffix)
 
+        print(f"POINT H: RESULT: {result.getvaluewithlinemap()}")
         self.generate_end(result)
 
         self.add_benchmark_harness(result)
 
+        print(f"POINT I: RESULT: {result.getvaluewithlinemap()}")
         return result.getvaluewithlinemap()
 
     def generate_and_run_autotune_block(self):
@@ -1988,9 +2002,12 @@ class PythonWrapperCodegen(CodeGen):
             self.kernel_autotune_names.add(kernel_name)
 
     def writeline(self, line):
+        print("*** writeline", line)
+        #breakpoint()
         self.lines.append(line)
 
     def writelines(self, lines):
+        print("*** writelines", lines)
         for line in lines:
             self.writeline(line)
 

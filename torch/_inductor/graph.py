@@ -1962,6 +1962,7 @@ class GraphLowering(torch.fx.Interpreter):
             self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()
         )
         print(f"*** point 1: linemap={linemap!r}, {bool(self.cpp_wrapper)}", file=sys.stderr)
+        breakpoint()
 
         GraphLowering.save_output_code(code)
         output_code_log.debug("Output code: \n%s", code)

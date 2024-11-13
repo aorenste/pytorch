@@ -514,6 +514,7 @@ def aggregate_origins(node_schedule):
 
 
 def get_fused_kernel_name(node_schedule, descriptive_names):
+    breakpoint()
     all_origins = aggregate_origins(node_schedule)
     if descriptive_names == "original_aten":
         # Bases the kernel name off of the top-level aten operator (i.e. pre-decompositions)

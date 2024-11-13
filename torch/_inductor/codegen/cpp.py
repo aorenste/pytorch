@@ -4584,6 +4584,7 @@ class CppScheduling(BaseScheduling):
 
     def define_kernel(self, src_code, nodes, kernel_args=None):
         wrapper = V.graph.wrapper_code
+        breakpoint()
         fused_name = (
             get_fused_kernel_name(nodes, config.cpp.descriptive_names)
             if config.cpp.descriptive_names
@@ -4611,6 +4612,7 @@ class CppScheduling(BaseScheduling):
     def flush(self):
         src_code = self.kernel_group.codegen_group()
         if src_code:
+            #breakpoint()
             kernel_name = self.define_kernel(
                 src_code, self.kernel_group.scheduled_nodes
             )

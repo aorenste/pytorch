@@ -1344,6 +1344,7 @@ def fx_codegen_and_compile(
 
             # scheme = _DebugFileFxCompile()
             # scheme = _DebugFileFxCompile()
+            # scheme = _DebugFxCompile()
             # scheme = _SubprocessFxCompile()
             scheme = _DebugFxCompile()
         except BypassFxGraphCache as e:
