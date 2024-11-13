@@ -1901,6 +1901,7 @@ class GraphLowering(torch.fx.Interpreter):
             V.graph.all_codegen_kernel_names,
         )
 
+        #breakpoint()
         result = self.wrapper_code.generate(self.is_inference)
         self.wrapper_code.pop_codegened_graph()
         return result
@@ -1960,6 +1961,7 @@ class GraphLowering(torch.fx.Interpreter):
         code, linemap = (
             self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()
         )
+        print(f"*** point 1: linemap={linemap!r}, {bool(self.cpp_wrapper)}", file=sys.stderr)
 
         GraphLowering.save_output_code(code)
         output_code_log.debug("Output code: \n%s", code)

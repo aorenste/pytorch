@@ -1630,6 +1630,8 @@ class CompiledFxGraph:
             with open(graph.cache_path) as f:
                 self.source_code = f.read()
         self.cache_linemap = graph.cache_linemap
+        print(f"*** POINT 0: cache_linemap={self.cache_linemap!r}", file=sys.stderr)
+        # breakpoint()
         # TODO - ordered set
         self.device_types = set(graph.device_types)
         self.device_idxs = set(graph.device_idxs)

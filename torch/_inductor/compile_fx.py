@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pickle
+import types
 import asyncio
 import contextlib
 import dataclasses
@@ -834,6 +836,7 @@ class _InProcessFxCompile(_FxCompileSync):
             Callable[[List[ExternKernelNode]], Any]
         ] = None,
     ) -> Union[CompiledFxGraph, str]:
+        dump_gm(gm)
         if (sleep_sec := config.sleep_sec_TESTING_ONLY) is not None:
             import time
 
@@ -985,6 +988,7 @@ class _InProcessFxCompile(_FxCompileSync):
                     const_code=const_code,
                     const_module=const_graph,
                 )
+                # breakpoint()
                 metrics_helper = metrics.CachedMetricsHelper()
                 with V.set_graph_handler(graph):
                     graph.run(*example_inputs)
@@ -1071,7 +1075,25 @@ class _InProcessFxCompile(_FxCompileSync):
                         counters["inductor"] - inductor_counters,
                     )
 
+            dump_graph(compiled_graph)
             return compiled_graph
+
+def dump_gm(gm: GraphModule) -> None:
+    print(f"*** INPUT: {str(gm)}", file=sys.stderr)
+
+
+def dump_graph(graph: Union[CompiledFxGraph, str]) -> None:
+    assert isinstance(graph, CompiledFxGraph)
+    print(f"*** OUTPUT: {graph!r}", file=sys.stderr)
+    current_callable = graph.current_callable
+    assert current_callable is not None
+    print(f"    {current_callable.__code__!r}", file=sys.stderr)
+    with open(current_callable.__code__.co_filename) as f:
+        program = f.read()
+    import textwrap
+    p = textwrap.indent(program, "    ")
+    print(f"{p}", file=sys.stderr)
+    print(f"--------------------------------------------------------------------------------", file=sys.stderr)
 
 
 def _current_fake_mode() -> torch._subclasses.FakeTensorMode:
@@ -1225,6 +1247,7 @@ class _DebugFxCompile(_FxCompileSerialized):
         return self._run_in_child(pickled_input)
 
 
+
 class _SubprocessFxCompile(_FxCompileSerialized):
     @override
     async def _send_to_child(self, input: _WireProtocolPickledInput) -> _WireProtocolPickledOutput:
@@ -1319,6 +1342,7 @@ def fx_codegen_and_compile(
                 # output.
                 raise BypassFxGraphCache("aot_mode not supported for async compile")
 
+            # scheme = _DebugFileFxCompile()
             # scheme = _DebugFileFxCompile()
             # scheme = _SubprocessFxCompile()
             scheme = _DebugFxCompile()

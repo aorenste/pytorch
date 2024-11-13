@@ -1982,12 +1982,14 @@ class CppKernel(Kernel):
         )
 
     def codegen_loops_impl(self, loop_nest, code, worksharing):
+        print("*** codegen_loops_impl", file=sys.stderr)
         threads = parallel_num_threads()
         assert self.call_ranges is not None
         kernels = loop_nest.get_kernels()
         has_outer_loop_kernel = any(
             isinstance(kernel, OuterLoopFusedKernel) for kernel in kernels
         )
+        print("*** codegen_loops_impl a", has_outer_loop_kernel, file=sys.stderr)
         if has_outer_loop_kernel:
             assert len(kernels) == 1
             assert isinstance(kernels[0], OuterLoopFusedKernel)
@@ -1998,6 +2000,7 @@ class CppKernel(Kernel):
             par_depth = self.decide_parallel_depth(
                 loop_nest.max_parallel_depth(), threads
             )
+        print("*** codegen_loops_impl b", par_depth, file=sys.stderr)
 
         with contextlib.ExitStack() as stack:
             if par_depth:
@@ -2155,6 +2158,8 @@ class CppKernel(Kernel):
         return "AOTI_TORCH_CHECK"
 
     def decide_parallel_depth(self, max_parallel_depth, threads):
+        print("*** decide_parallel_depth a", max_parallel_depth, threads, file=sys.stderr)
+        #breakpoint()
         assert self.call_ranges is not None
         ranges = self.call_ranges[:max_parallel_depth]
         seq = self.size_hint()
@@ -4487,6 +4492,7 @@ class CppScheduling(BaseScheduling):
         self,
         node: Union[OuterLoopFusedSchedulerNode, FusedSchedulerNode, SchedulerNode],
     ):
+        print(f"*** codegen_node {node}", file=sys.stderr)
         """
         Turn an set of pre-fused nodes into a C++ kernel.
         """
@@ -4627,6 +4633,7 @@ class KernelGroup:
         return cls(self.args, parallel_num_threads(), *args)
 
     def finalize_kernel(self, new_kernel, nodes):
+        print("*** finalize_kernel", file=sys.stderr)
         self.scheduled_nodes += nodes
         code = self.loops_code
         ws = self.ws
@@ -4707,6 +4714,7 @@ class WorkSharing:
             if config.cpp.dynamic_threads:
                 self.code.writeline("#pragma omp parallel")
             else:
+                #breakpoint()
                 self.code.writeline(f"#pragma omp parallel num_threads({threads})")
             self.stack.enter_context(self.code.indent())
             self.code.writeline(
