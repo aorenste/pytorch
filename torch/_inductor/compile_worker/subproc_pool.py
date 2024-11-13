@@ -1,4 +1,5 @@
 import functools
+import io
 import itertools
 import logging
 import multiprocessing
@@ -12,15 +13,31 @@ import traceback
 import typing
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from typing import Any, BinaryIO, Callable, Dict, Tuple, TypeVar
-from typing_extensions import Never, ParamSpec
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Callable, Dict, Optional, Tuple, TypeVar
+from typing_extensions import Never, override, ParamSpec
+
+import torch
 
 # _thread_safe_fork is needed because the subprocesses in the pool can read
 # justknobs, e.g., in the Triton compiler. For internal, the import installs
 # functionality to destroy singletons before forking and re-enable them after.
 import torch._thread_safe_fork  # noqa: F401
+import torch.utils._pytree as pytree
 from torch._inductor import config
 from torch._inductor.compile_worker.watchdog import _async_compile_initializer
+from torch._subclasses.fake_tensor import (  # extract_tensor_metadata,
+    FakeTensor,
+    FakeTensorMode,
+    Tensor,
+)
+from torch._subclasses.meta_utils import (
+    MetaConverter,
+    MetaTensorDesc,
+    MetaTensorDescriber,
+)
+from torch.fx.experimental.sym_node import SymNode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 
 log = logging.getLogger(__name__)
@@ -144,7 +161,8 @@ class SubprocPool:
     ) -> Future[_T]:
         if args or kwargs:
             job_fn = functools.partial(job_fn, *args, **kwargs)
-        job_data = pickle.dumps(job_fn, pickle.HIGHEST_PROTOCOL)
+        from torch.fx.graph_pickler import _SubprocPickler
+        job_data = _SubprocPickler.dumps(job_fn)
         future: Future[_T]
         with self.futures_lock:
             job_id = next(self.job_id_count)
@@ -157,31 +175,37 @@ class SubprocPool:
         return future
 
     def _read_thread(self) -> None:
-        try:
-            while True:
-                job_id, data = _recv_msg(self.read_pipe)
-                if job_id < 0:
-                    if self.running:
-                        log.warning("SubprocPool unclean exit")
-                    self.read_pipe.close()
+        while True:
+            job_id, data = _recv_msg(self.read_pipe)
+            # breakpoint()
+            if job_id < 0:
+                if self.running:
+                    log.warning("SubprocPool unclean exit")
+                self.read_pipe.close()
+                return
+
+            try:
+                from torch.fx.graph_pickler import _SubprocUnpickler, _UnpickleState
+                unpickle_state = _UnpickleState(None)  # type: ignore[arg-type]
+                result = _SubprocUnpickler.loads(data, unpickle_state)
+            except Exception as e:
+                log.exception("failure in SubprocPool._read_thread")
+                result = e
+
+            with self.futures_lock:
+                if not self.running:
                     return
-                result = pickle.loads(data)
-                with self.futures_lock:
-                    if not self.running:
-                        return
-                    if isinstance(result, _SubprocExceptionInfo):
-                        # An exception occurred in the submitted job
-                        self.pending_futures[job_id].set_exception(
-                            SubprocException(result.details)
-                        )
-                    elif isinstance(result, Exception):
-                        # An exception occurred in some of our subprocess machinery.
-                        self.pending_futures[job_id].set_exception(result)
-                    else:
-                        self.pending_futures[job_id].set_result(result)
-                    del self.pending_futures[job_id]
-        except Exception:
-            log.exception("failure in SubprocPool._read_thread")
+                if isinstance(result, _SubprocExceptionInfo):
+                    # An exception occurred in the submitted job
+                    self.pending_futures[job_id].set_exception(
+                        SubprocException(result.details)
+                    )
+                elif isinstance(result, Exception):
+                    # An exception occurred in some of our subprocess machinery.
+                    self.pending_futures[job_id].set_exception(result)
+                else:
+                    self.pending_futures[job_id].set_result(result)
+                del self.pending_futures[job_id]
 
     def shutdown(self) -> None:
         try:
@@ -216,7 +240,8 @@ class SubprocMain:
     def _new_pool(self, nprocs: int, warm: bool) -> ProcessPoolExecutor:
         pool = ProcessPoolExecutor(
             nprocs,
-            mp_context=multiprocessing.get_context("fork"),
+            # "fork" causes CUDA problems.
+            mp_context=multiprocessing.get_context("spawn"),
             initializer=functools.partial(_async_compile_initializer, os.getpid()),
         )
         multiprocessing.util.Finalize(None, pool.shutdown, exitpriority=sys.maxsize)
@@ -263,7 +288,8 @@ class SubprocMain:
                 result = future.result()
             except Exception as e:
                 log.exception("Error in subprocess")
-                result = pickle.dumps(e, pickle.HIGHEST_PROTOCOL)
+                from torch.fx.graph_pickler import _SubprocPickler
+                result = _SubprocPickler.dumps(e)
             assert isinstance(result, bytes)
             with self.write_lock:
                 if self.running:
@@ -274,13 +300,25 @@ class SubprocMain:
 
     @staticmethod
     def do_job(data: bytes) -> bytes:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
         # do the pickle/unpickle in the sub-subproc
-        job = pickle.loads(data)
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env)
+
+        from torch.fx.graph_pickler import _SubprocUnpickler, _UnpickleState
+        unpickle_state = _UnpickleState(fake_mode)
+
+        job = typing.cast(
+            Callable[[], object], _SubprocUnpickler.loads(data, unpickle_state)
+        )
+
         try:
             result = job()
         except Exception as e:
             result = _SubprocExceptionInfo(traceback.format_exc())
-        return pickle.dumps(result, pickle.HIGHEST_PROTOCOL)
+        from torch.fx.graph_pickler import _SubprocPickler
+        return _SubprocPickler.dumps(result)
 
 
 AnyPool = typing.Union[ProcessPoolExecutor, SubprocPool]

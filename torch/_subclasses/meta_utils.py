@@ -475,7 +475,7 @@ class MetaStorageDesc:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class MetaTensorDesc(Generic[_TensorT]):
     id: MetaTensorId
     ndim: int
@@ -542,7 +542,7 @@ class MetaTensorDesc(Generic[_TensorT]):
 
     # Everything below is NOT serializable, need some more work
 
-    _UNSERIALIZABLE: ClassVar[List[str]] = [
+    _UNSERIALIZABLE: ClassVar[Set[str]] = {
         "ctx",
         "type",
         "fake_mode",
@@ -553,7 +553,7 @@ class MetaTensorDesc(Generic[_TensorT]):
         "autograd_meta_from",
         "data",
         "nested_int",
-    ]
+    }
 
     ctx: Optional[object] = None  # is_traceable_wrapper_subclass
     type: Optional[Type] = None  # is_traceable_wrapper_subclass
@@ -598,7 +598,7 @@ class MetaTensorDesc(Generic[_TensorT]):
             # fields (feel free to add other special cases as appropriate)
             if k in ["data", "autograd_meta_from"]:
                 return None  # never repr these
-            if k in set(MetaTensorDesc._UNSERIALIZABLE):
+            if k in MetaTensorDesc._UNSERIALIZABLE:
                 return repr(v)
             if isinstance(v, (torch.device, torch.dtype, torch.layout)):
                 return repr(v)
@@ -759,6 +759,7 @@ class MetaConverter(Generic[_TensorT]):
         callback: Callable[[Callable[[], torch.Tensor]], _TensorT],
         source: Optional[Source],
         symbolic_context: Optional[SymbolicContext],
+        override_device: Optional[Union[torch.device, str]],
     ) -> _TensorT:
         if source is None:
             from torch._dynamo.source import ConstantSource
@@ -917,6 +918,7 @@ class MetaConverter(Generic[_TensorT]):
                         callback,
                         source,
                         symbolic_context,
+                        override_device,
                     )
 
                 inner_tensors = {}
@@ -1169,6 +1171,7 @@ class MetaConverter(Generic[_TensorT]):
                     all_dynamic_symbolic_context(
                         visited_desc, temp_source, shape_env, callback
                     ),
+                    override_device,
                 )
 
             # Replay the view, swapping out any non-symbolic SymInts or real tensors
@@ -1380,6 +1383,7 @@ class MetaConverter(Generic[_TensorT]):
                                 # work, take a closer look.
                                 source,
                                 symbolic_context,
+                                override_device,
                             )
                             r = self._checked_cast_tensor_t(
                                 _wrap_functional_tensor(ft, t.current_level),
@@ -1421,6 +1425,7 @@ class MetaConverter(Generic[_TensorT]):
                         callback,
                         source,
                         symbolic_context,
+                        override_device,
                     )
                     r = self._checked_cast_tensor_t(
                         torch._to_functional_tensor(unwrapped)
@@ -1454,6 +1459,7 @@ class MetaConverter(Generic[_TensorT]):
                         callback,
                         torch._dynamo.source.AttrSource(source, "_base"),
                         base_symbolic_context,
+                        override_device,
                     )
 
                     def is_c_of_r(
@@ -1575,7 +1581,7 @@ class MetaConverter(Generic[_TensorT]):
                                 sizes,
                                 strides,
                                 dtype=t.dtype,
-                                device="meta",
+                                device=override_device or t.device,
                             )
                         )
                         if self.copy_data:
@@ -1690,6 +1696,7 @@ class MetaConverter(Generic[_TensorT]):
                         callback,
                         AttrSource(source, "grad"),
                         symbolic_context,
+                        override_device,
                     )
                 torch._C._set_conj(r, t.is_conj)
                 torch._C._set_neg(r, t.is_neg)
@@ -1701,7 +1708,8 @@ class MetaConverter(Generic[_TensorT]):
             # Thanks to storage resizing, it's possible to end up with a tensor
             # that advertises a real size, but has a storage that actually has zero bytes.
             # Need to reflect this in the generated FakeTensor.
-            if t.storage is not None and t.storage.size == 0:
+            from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
+            if t.storage is not None and guard_size_oblivious(t.storage.size == 0):
                 r.untyped_storage().resize_(0)
 
             if t.is_parameter:
@@ -1802,6 +1810,7 @@ class MetaConverter(Generic[_TensorT]):
                 callback_,
                 source,
                 symbolic_context,
+                override_device="meta",
             )
 
         if type(t) is torch.nn.Parameter:
