@@ -1,9 +1,9 @@
-# mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
 import itertools
 import operator
 from functools import reduce
-from typing import Callable, Dict
+from typing import Callable, Dict, TypeVar
+from typing_extensions import ParamSpec
 
 import sympy
 
@@ -15,6 +15,9 @@ from torch.fx.tensor_type import Dyn, is_consistent, is_more_precise, TensorType
 from torch.nn.modules.batchnorm import BatchNorm2d
 from torch.nn.modules.conv import Conv2d
 
+
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
 
 _INFERENCE_RULES: Dict[Target, Callable] = {}
 _REFINEMENT_RULES: Dict[Target, Callable] = {}
@@ -86,8 +89,8 @@ def broadcast_types(t1, t2):
         raise TypeError(f"Cannot broadcast types {t1} and {t2}")
 
 
-def register_inference_rule(call_target):
-    def register(fn):
+def register_inference_rule(call_target: Target) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    def register(fn: Callable[_P, _T]) -> Callable[_P, _T]:
         if call_target in _INFERENCE_RULES:
             raise RuntimeError(f"Inference rule already registered for {call_target}!")
         _INFERENCE_RULES[call_target] = fn
@@ -96,8 +99,8 @@ def register_inference_rule(call_target):
     return register
 
 
-def register_refinement_rule(call_target):
-    def register(fn):
+def register_refinement_rule(call_target: Target) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    def register(fn: Callable[_P, _T]) -> Callable[_P, _T]:
         if call_target in _REFINEMENT_RULES:
             raise RuntimeError(f"Refinement rule already registered for {call_target}!")
         _REFINEMENT_RULES[call_target] = fn
@@ -106,8 +109,8 @@ def register_refinement_rule(call_target):
     return register
 
 
-def register_algebraic_expressions_inference_rule(call_target):
-    def register(fn):
+def register_algebraic_expressions_inference_rule(call_target: Target) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    def register(fn: Callable[_P, _T]) -> Callable[_P, _T]:
         if call_target in _RULES:
             raise RuntimeError(f"Rule already registered for {call_target}!")
         _RULES[call_target] = fn
