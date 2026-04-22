@@ -158,3 +158,9 @@ matches = "torch/_functorch/**"
 [sub-config.errors]
 implicit-import = false
 implicit-any = true
+
+[[sub-config]]
+matches = "torch/testing/_internal/hypothesis_utils.py"
+[sub-config.errors]
+implicit-import = false
+implicit-any = true

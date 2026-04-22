@@ -1,5 +1,3 @@
-# mypy: ignore-errors
-
 from collections import defaultdict
 from collections.abc import Iterable
 import numpy as np
@@ -50,7 +48,8 @@ def _get_valid_min_max(qparams):
 # it is too old, removes the `width` parameter (which was introduced)
 # in 3.67.0
 def _floats_wrapper(*args, **kwargs):
-    if 'width' in kwargs and hypothesis.version.__version_info__ < (3, 67, 0):
+    _ver: tuple[int, ...] = hypothesis.version.__version_info__
+    if 'width' in kwargs and _ver < (3, 67, 0):
         # As long as nan, inf, min, max are not specified, reimplement the width
         # parameter for older versions of hypothesis.
         no_nan_and_inf = (
@@ -198,6 +197,7 @@ def tensor(draw, shapes=None, elements=None, qparams=None, dtype=np.float32):
     if isinstance(shapes, SearchStrategy):
         _shape = draw(shapes)
     else:
+        assert shapes is not None
         _shape = draw(st.sampled_from(shapes))
     if qparams is None:
         if elements is None:
@@ -223,6 +223,7 @@ def per_channel_tensor(draw, shapes=None, elements=None, qparams=None):
     if isinstance(shapes, SearchStrategy):
         _shape = draw(shapes)
     else:
+        assert shapes is not None
         _shape = draw(st.sampled_from(shapes))
     if qparams is None:
         if elements is None:
@@ -317,7 +318,7 @@ def tensor_conv(
     output_channels = output_channels_per_group * groups
 
     if isinstance(spatial_dim, Iterable):
-        spatial_dim = draw(st.sampled_from(spatial_dim))
+        spatial_dim = draw(st.sampled_from(tuple(spatial_dim)))
 
     feature_map_shape = [draw(st.integers(*feature_map_range)) for _ in range(spatial_dim)]
 
@@ -333,20 +334,22 @@ def tensor_conv(
             bias_shape = output_channels
 
     # Resolve the tensors
-    if qparams is not None:
-        if isinstance(qparams, (list, tuple)):
-            if len(qparams) != 3:
-                raise AssertionError("Need 3 qparams for X, w, b")
-        else:
-            qparams = [qparams] * 3
+    if qparams is None:
+        qparams_list: list[object] = [None, None, None]
+    elif isinstance(qparams, (list, tuple)):
+        if len(qparams) != 3:
+            raise AssertionError("Need 3 qparams for X, w, b")
+        qparams_list = list(qparams)
+    else:
+        qparams_list = [qparams] * 3
 
     X = draw(tensor(shapes=(
         (batch_size, input_channels) + tuple(feature_map_shape),),
-        elements=elements, qparams=qparams[0]))
+        elements=elements, qparams=qparams_list[0]))
     W = draw(tensor(shapes=(weight_shape,), elements=elements,
-                    qparams=qparams[1]))
+                    qparams=qparams_list[1]))
     b = draw(tensor(shapes=(bias_shape,), elements=elements,
-                    qparams=qparams[2]))
+                    qparams=qparams_list[2]))
 
     return X, W, b, groups, tr
 
@@ -358,6 +361,7 @@ hypothesis_version = tuple(map(int, version("hypothesis").split(".")[:3]))
 
 if (3, 16, 0) <= hypothesis_version < (3, 27, 0):
     # Hypothesis 3.16 → 3.26: use `timeout` instead of `deadline`
+    # pyrefly: ignore[missing-attribute]
     settings.register_profile("no_deadline", timeout=hypothesis.unlimited)
 else:
     # Hypothesis >=3.27: use `deadline=None`
