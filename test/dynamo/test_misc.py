@@ -113,6 +113,9 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.jit_utils import JitTestCase
 from torch.utils._sympy.numbers import int_oo
 
+if IS_FBCODE:
+    from caffe2.test.dynamo import _pybind11_enum_test
+
 
 pytree_modules = {
     "python": python_pytree,
@@ -238,18 +241,21 @@ class MiscTests(torch._inductor.test_case.TestCase):
 
     @torch.testing._internal.common_utils.scoped_load_inline
     def test_pybind11_enum_conversion(self, load_inline):
-        cpp_source = """
-        #include <torch/extension.h>
+        if IS_FBCODE:
+            mod = _pybind11_enum_test
+        else:
+            cpp_source = """
+            #include <torch/extension.h>
 
-        enum class E { A = 0, B = 1 };
+            enum class E { A = 0, B = 1 };
 
-        PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-            py::enum_<E>(m, "E")
-                .value("A", E::A)
-                .value("B", E::B);
-        }
-        """
-        mod = load_inline(name="pybind11_enum_test", cpp_sources=cpp_source)
+            PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+                py::enum_<E>(m, "E")
+                    .value("A", E::A)
+                    .value("B", E::B);
+            }
+            """
+            mod = load_inline(name="pybind11_enum_test", cpp_sources=cpp_source)
         e = mod.E.A
         self.assertEqual(
             torch.compile(lambda x: int(x), backend="eager", fullgraph=True)(e), 0
