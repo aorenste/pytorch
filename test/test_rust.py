@@ -1,13 +1,22 @@
 # Owner(s): ["module: devx"]
 
+import contextlib
+import io
+import sys
 import unittest
 
 import torch
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 @unittest.skipIf(torch._rust is None, "torch._rust extension is not built")
 class TestRustBindings(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_function(self):
         self.assertEqual(torch._rust.test_function(), "hello from rust")
 
@@ -76,6 +85,74 @@ class TestRustBindings(TestCase):
         self.assertEqual(torch._rust.collect_tensors(()), [])
         self.assertEqual(torch._rust.collect_tensors({}), [])
         self.assertEqual(torch._rust.collect_tensors(set()), [])
+
+
+def _leaf():
+    return 1
+
+
+def _middle():
+    return sum(_leaf() for _ in range(3))
+
+
+@unittest.skipIf(torch._rust is None, "torch._rust extension is not built")
+@unittest.skipIf(sys.version_info < (3, 12), "requires Python 3.12+")
+class TestCompile3(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def _run(self, fn, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = fn(*args)
+        return result, out.getvalue()
+
+    def test_prints_callees_in_order(self):
+        @torch.compile3
+        def top(x):
+            return _middle() + x
+
+        result, out = self._run(top, 10)
+        self.assertEqual(result, 13)
+        headers = [line for line in out.splitlines() if line.startswith("=== ")]
+        names = [h.split()[1] for h in headers]
+        self.assertEqual(
+            names,
+            [
+                "TestCompile3.test_prints_callees_in_order.<locals>.top",
+                "_middle",
+                "_middle.<locals>.<genexpr>",
+                "_leaf",
+            ],
+        )
+        self.assertIn("RETURN_VALUE", out)
+
+    def test_each_code_printed_once_per_call(self):
+        @torch.compile3
+        def top():
+            return [_leaf() for _ in range(5)]
+
+        _, out = self._run(top)
+        self.assertEqual(out.count("=== _leaf "), 1)
+        _, out = self._run(top)
+        self.assertEqual(out.count("=== _leaf "), 1)
+
+    def test_disabled_after_return_and_raise(self):
+        @torch.compile3
+        def boom():
+            raise ValueError("boom")
+
+        with self.assertRaises(ValueError):
+            self._run(boom)
+        _, out = self._run(_middle)
+        self.assertEqual(out, "")
+
+    def test_preserves_metadata(self):
+        def documented():
+            """doc"""
+
+        wrapped = torch.compile3(documented)
+        self.assertEqual(wrapped.__name__, "documented")
+        self.assertEqual(wrapped.__doc__, "doc")
 
 
 if __name__ == "__main__":

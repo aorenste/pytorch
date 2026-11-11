@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyTuple};
 
 mod bindings;
+mod bytecode_printer;
 
 use bindings::Tensor;
 
@@ -56,13 +57,13 @@ fn collect_into<'py>(
 
 // Declare the module safe to run without the GIL so the free-threaded CPython
 // build (e.g. py3.14t) does not re-enable the GIL and emit a RuntimeWarning when
-// torch._rust is imported. The functions here only do read-only access through
-// pyo3's safe APIs and hold no shared mutable state; preserve that when adding
-// new ones.
+// torch._rust is imported. Any shared mutable state must be thread-safe without
+// relying on the GIL (see bytecode_printer.rs, which guards it with a Mutex).
 #[pymodule(gil_used = false)]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_function, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_size, m)?)?;
     m.add_function(wrap_pyfunction!(collect_tensors, m)?)?;
+    m.add_function(wrap_pyfunction!(bytecode_printer::call_with_bytecode_printing, m)?)?;
     Ok(())
 }
