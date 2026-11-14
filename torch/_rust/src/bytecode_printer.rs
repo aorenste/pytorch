@@ -92,6 +92,13 @@ fn print_code(py: Python<'_>, code: &Bound<'_, PyAny>) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("depth", 0)?;
     py.import("dis")?.call_method("dis", (code,), Some(&kwargs))?;
+    let cfg_text = match crate::cfg::python::code_info(code)
+        .and_then(|info| crate::cfg::build(info, true, None).map_err(crate::cfg::python::to_pyerr))
+    {
+        Ok(cfg) => format!("--- CFG ---\n{}", cfg.render(false, false)),
+        Err(err) => format!("<cfg unsupported: {err}>"),
+    };
+    py.import("builtins")?.call_method1("print", (cfg_text.trim_end(),))?;
     Ok(())
 }
 

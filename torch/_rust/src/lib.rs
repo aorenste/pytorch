@@ -3,6 +3,7 @@ use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyTuple};
 
 mod bindings;
 mod bytecode_printer;
+mod cfg;
 
 use bindings::Tensor;
 
@@ -65,5 +66,8 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_size, m)?)?;
     m.add_function(wrap_pyfunction!(collect_tensors, m)?)?;
     m.add_function(wrap_pyfunction!(bytecode_printer::call_with_bytecode_printing, m)?)?;
+    m.add_function(wrap_pyfunction!(cfg::python::bytecode_to_cfg, m)?)?;
+    m.add_function(wrap_pyfunction!(cfg::python::_cfg_opcodes, m)?)?;
+    m.add_function(wrap_pyfunction!(cfg::python::_cfg_signature, m)?)?;
     Ok(())
 }
