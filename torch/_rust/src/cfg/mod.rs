@@ -10,6 +10,7 @@ pub mod bytecode;
 pub mod interp;
 pub mod ir;
 pub mod opcodes;
+pub mod optimize;
 pub mod outline;
 pub mod python;
 pub mod simplify;

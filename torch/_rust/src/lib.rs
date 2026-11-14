@@ -70,6 +70,11 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cfg::python::bytecode_to_cfg, m)?)?;
     m.add_function(wrap_pyfunction!(exec::call_with_cfg_execution, m)?)?;
     m.add_function(wrap_pyfunction!(exec::_set_cfg_outline, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_set_cfg_optimize, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_set_cfg_record, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::cfg_observed, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::optimize_block, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::torch_ops::set_print_torch_ops, m)?)?;
     m.add_function(wrap_pyfunction!(cfg::python::_cfg_opcodes, m)?)?;
     m.add_function(wrap_pyfunction!(cfg::python::_cfg_signature, m)?)?;
     Ok(())

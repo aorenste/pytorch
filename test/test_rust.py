@@ -3,13 +3,16 @@
 import _thread
 import contextlib
 import dis
+import gc
 import importlib
 import inspect
 import io
 import re
 import signal
 import sys
+import types
 import unittest
+import weakref
 
 import torch
 from torch.testing._internal.common_utils import (
@@ -1150,10 +1153,16 @@ class _Del:
 class TestCfgExecution(TestCase):
     hw_classification = HardwareClassification.GENERIC
 
-    # Runs fn both normally and under the CFG executor; results must match.
+    # Runs fn normally and under the CFG executor, recording side effects and
+    # types or not; results must match.
     def same(self, fn, *args):
         expected = fn(*args)
         self.assertEqual(torch._rust.call_with_cfg_execution(fn, *args), expected)
+        torch._rust._set_cfg_record(False)
+        try:
+            self.assertEqual(torch._rust.call_with_cfg_execution(fn, *args), expected)
+        finally:
+            torch._rust._set_cfg_record(True)
         return expected
 
     def test_control_flow(self):
@@ -1278,6 +1287,45 @@ class TestCfgExecution(TestCase):
 
         self.same(f)
 
+    def test_load_global_cache(self):
+        # A LoadGlobal reuses its last lookup while the globals and builtins
+        # dicts are unchanged.
+        bt = {"len": "builtin len"}
+        ns = {"__builtins__": bt}
+        exec("def f():\n    return x, len\n", ns)
+        f = ns["f"]
+
+        def run():
+            bt["len"] = "builtin len"
+            out = []
+            for x in (1, 2):
+                ns["x"] = x
+                out.append(f())
+            ns["len"] = "global len"
+            out.append(f())
+            del ns["len"]
+            bt["len"] = "new builtin len"
+            out.append(f())
+            out.append(types.FunctionType(f.__code__, {"__builtins__": bt, "x": 3})())
+            del ns["x"]
+            try:
+                f()
+            except NameError as e:
+                out.append(str(e))
+            return out
+
+        self.assertEqual(
+            self.same(run),
+            [
+                (1, "builtin len"),
+                (2, "builtin len"),
+                (2, "global len"),
+                (2, "new builtin len"),
+                (3, "new builtin len"),
+                "name 'x' is not defined",
+            ],
+        )
+
     def test_recursion_limit(self):
         def rec(n):
             return rec(n + 1)
@@ -1360,6 +1408,601 @@ class TestCfgExecution(TestCase):
                 self.assertTrue(self.same(fresh(_cfg_outline_context)))
             finally:
                 torch._rust._set_cfg_outline(None)
+
+    def test_print_torch_ops(self):
+        def inner(t):
+            return t.relu()
+
+        def f(x, w):
+            y = torch.nn.functional.linear(x, w)
+            z = inner(y) + 1
+            return z.sum()
+
+        x = torch.ones(2, 3, requires_grad=True)
+        w = torch.ones(4, 3)
+        out = io.StringIO()
+        torch._rust.set_print_torch_ops(True)
+        try:
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.same(f, x, w), f(x, w))
+        finally:
+            torch._rust.set_print_torch_ops(False)
+        first = {"f": f.__code__.co_firstlineno, "inner": inner.__code__.co_firstlineno}
+        # Lines relative to each function's def, so the golden survives edits.
+        text = re.sub(
+            r"# \S+\.(\w+) \(test_rust\.py:(\d+)\) @(\d+)",
+            lambda m: f"# {m[1]} line +{int(m[2]) - first[m[1]]} @{m[3]}",
+            out.getvalue(),
+        )
+        # Printed by both executor runs (recording and not).
+        self.assertExpectedInline(
+            text,
+            """\
+torch op: aten::linear(f32[2, 3], f32[4, 3], None)  # f line +1 @78
+torch op: aten::relu(f32[2, 4])  # inner line +1 @24
+torch op: aten::add.Tensor(f32[2, 4], i64[], alpha=1)  # f line +2 @104
+torch op: aten::sum(f32[2, 4], dtype=None)  # f line +3 @132
+torch op: aten::linear(f32[2, 3], f32[4, 3], None)  # f line +1 @78
+torch op: aten::relu(f32[2, 4])  # inner line +1 @24
+torch op: aten::add.Tensor(f32[2, 4], i64[], alpha=1)  # f line +2 @104
+torch op: aten::sum(f32[2, 4], dtype=None)  # f line +3 @132
+""",
+        )
+        # Off again: nothing is printed.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            torch._rust.call_with_cfg_execution(f, x, w)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_print_torch_ops_with_hop(self):
+        # Higher-order ops dispatch in Python and see PreDispatch enabled with
+        # no pre-dispatch mode; they must skip it rather than fail.
+        def f(x):
+            return torch.cond(x.sum() > 0, torch.sin, torch.cos, (x,))
+
+        x = torch.ones(3)
+        torch._rust.set_print_torch_ops(True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.same(f, x)
+        finally:
+            torch._rust.set_print_torch_ops(False)
+        self.assertIn("aten::sin", out.getvalue())
+
+    def test_side_effects(self):
+        def py():
+            return 1
+
+        def via_c():
+            return sorted([2, 1], key=lambda v: -v)
+
+        def gen():
+            yield torch.ones(2)
+
+        def f(x):
+            py()
+            via_c()
+            list(gen())
+            return x + 1
+
+        # A fresh code object: the executor keeps the table with its CFG.
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__, closure=f.__closure__)
+        with self.assertRaisesRegex(ValueError, "hasn't run"):
+            torch._rust.cfg_observed(f)
+        for _ in range(2):
+            self.same(f, torch.ones(2))
+        text = re.sub(r"\S+<locals>\.", "", torch._rust.cfg_observed(f, types=False))
+        self.assertExpectedInline(
+            text,
+            """\
+bb0:
+  CopyFreeVars 3
+  Resume
+  %0 = LoadDeref py
+  %1 = Call 0 null, %0
+      callee py
+      effects [2 visits]:
+        call py
+  %2 = LoadDeref via_c
+  %3 = Call 0 null, %2
+      callee via_c
+      effects [2 visits]:
+        call via_c
+  %4 = LoadGlobal list
+  %5 = LoadDeref gen
+  %6 = Call 0 null, %5
+      callee gen
+      effects [2 visits]:
+        call gen
+  %7 = Call 1 null, %4, %6
+      callee builtins.list
+      effects [2 visits]:
+        resume gen
+        resume gen
+  %8 = LoadLocal x
+  %9 = Const 1
+  %10 = BinaryOp + %8, %9
+      effects [2 visits]:
+        torch aten::add.Tensor(f32[2], i64[], alpha=1)
+  return %10
+""",
+        )
+        text = re.sub(
+            r"\S+<locals>\.", "", torch._rust.cfg_observed(via_c, types=False)
+        )
+        lam = "        call <lambda> (indirect)\n"
+        self.assertIn(lam + lam, text)
+
+    def test_observed_types(self):
+        def f(x, n, opt, k):
+            acc = []
+            for i in range(n):
+                acc += [i]
+            y = x if opt is None else opt
+            return (acc, "k"), {k: y}
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        p = torch.nn.Parameter(torch.ones(2, 2))
+        self.same(f, torch.ones(4), 2, None, 1)
+        self.same(f, torch.ones(8), 3, p, 1 << 70)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f, effects=False),
+            """\
+bb0:
+  Resume
+  %0: list[0] = BUILD_LIST 0
+  StoreLocal acc %0
+  %1: type = LoadGlobal range
+  %2: int[2..3] = LoadLocal n
+  %3: range = Call 1 null, %1, %2
+  %4: range_iterator = GetIter %3
+  jump bb1(s0=%4)
+bb1(%5 s0: range_iterator):
+  %6 = IterNext %5
+  %7: int[0..2] | null = Project 0 %6
+  %8: bool = Project 1 %6
+  branch %8, bb2(s0=%5, s1=%7), bb3
+bb2(%9 s0: range_iterator, %10 s1: int[0..2]):
+  StoreLocal i %10
+  %11: list[0..2] = LoadLocal acc
+  %12: int[0..2] = LoadLocal i
+  %13: list[1] = BUILD_LIST 1 %12
+  %14: list[1..3] = BinaryOp += %11, %13
+  StoreLocal acc %14
+  EvalBreaker
+  jump bb1(s0=%9)
+bb3:
+  %15: None | Parameter(f32 cpu [2, 2] grad) = LoadLocal opt
+  %16: bool = IsNone %15
+  branch %16, bb4, bb5
+bb4:
+  %17: Tensor(f32 cpu [4]) = LoadLocal x
+  jump bb6(s0=%17)
+bb5:
+  %18: Parameter(f32 cpu [2, 2] grad) = LoadLocal opt
+  jump bb6(s0=%18)
+bb6(%19 s0: Tensor(f32 cpu [4]) | Parameter(f32 cpu [2, 2] grad)):
+  StoreLocal y %19
+  %20: list[2..3] = LoadLocal acc
+  %21: str "k" = Const 'k'
+  %22: tuple(list[2..3], str "k") = BuildTuple 2 %20, %21
+  %23: int[?] = LoadLocal k
+  %24: Tensor(f32 cpu [4]) | Parameter(f32 cpu [2, 2] grad) = LoadLocal y
+  %25: dict[1] = BUILD_MAP 1 %23, %24
+  %26: tuple(tuple[2], dict[1]) = BuildTuple 2 %22, %25
+  return %26
+""",
+        )
+
+    def test_optimize_block(self):
+        def f(x, n):
+            y = x * 2
+            if n:
+                y = y + 1
+            return y
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        with self.assertRaisesRegex(ValueError, "hasn't run"):
+            torch._rust.optimize_block(f, 0)
+        self.same(f, torch.ones(2), 1)
+        torch._rust.optimize_block(f, 1)
+        self.same(f, torch.ones(2), 1)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f),
+            """\
+bb0:
+  Resume
+  %0: Tensor(f32 cpu [2]) = LoadLocal x
+  %1: int 2 = Const 2
+  %2: Tensor(f32 cpu [2]) = BinaryOp * %0, %1
+      effects [2 visits]:
+        torch aten::mul.Tensor(f32[2], i64[])
+  StoreLocal y %2
+  %3: int 1 = LoadLocal n
+  %4: True = ToBool %3
+  branch %4, bb1, bb4
+bb1:
+  %5: Tensor(f32 cpu [2]) = LoadLocal y
+  jump bb2(s0=%5)
+bb2(%6 s0: Tensor(f32 cpu [2])):
+  version [guard: plain_tensor(s0), no_torch_function_mode]:
+    %7: int 1 = Const 1
+    %8: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %6, %7
+        effects [2 visits]:
+          torch aten::add.Tensor(f32[2], i64[], alpha=1)
+    outputs [%8]
+  jump bb3(s0=o0)
+  origin:
+    bb0(%0 s0):
+      %1 = Const 1
+      %2 = BinaryOp + %0, %1
+      leave(%2)
+bb3(%9 s0: Tensor(f32 cpu [2])):
+  StoreLocal y %9
+  jump bb4
+bb4:
+  %10: Tensor(f32 cpu [2]) = LoadLocal y
+  return %10
+""",
+        )
+        # bb1 is glue now, with nothing left to optimize; bb2 is the pure block.
+        torch._rust.optimize_block(f, 1)
+        with self.assertRaisesRegex(ValueError, "already has an origin"):
+            torch._rust.optimize_block(f, 2)
+        with self.assertRaisesRegex(ValueError, "no block bb9"):
+            torch._rust.optimize_block(f, 9)
+
+    def test_optimize_block_under_suspended_generator(self):
+        def gen(n):
+            t = n + 1
+            yield t
+            yield t * 2
+
+        code = gen.__code__.replace(co_name="gen")
+        gen = type(gen)(code, gen.__globals__)
+        self.assertEqual(
+            torch._rust.call_with_cfg_execution(lambda: list(gen(1))), [2, 4]
+        )
+        g = gen(3)
+        self.assertEqual(torch._rust.call_with_cfg_execution(next, g), 4)
+        with self.assertRaisesRegex(ValueError, "generator suspends"):
+            torch._rust.optimize_block(gen, 0)
+        # The handler block holds no resume point; g resumes under the new CFG.
+        torch._rust.optimize_block(gen, 1)
+        self.assertEqual(torch._rust.call_with_cfg_execution(list, g), [8])
+
+    # Optimizes every block of fn that can be.
+    def optimize_all(self, fn):
+        b = 0
+        while True:
+            try:
+                torch._rust.optimize_block(fn, b)
+            except ValueError as e:
+                if "no block" in str(e):
+                    return
+            b += 1
+
+    def test_callees_dont_keep_objects_alive(self):
+        # Through a proxy, p.copy is a builtin bound to the set; a class is
+        # recorded through a weakref.
+        def f(p):
+            return p.copy()
+
+        def g(cls):
+            return cls()
+
+        class A:
+            pass
+
+        s = {1}
+        p = weakref.proxy(s)
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, p), {1})
+        r = weakref.ref(A)
+        torch._rust.call_with_cfg_execution(g, A)
+        self.assertIn("callee", torch._rust.cfg_observed(g))
+        del s, A
+        gc.collect()
+        with self.assertRaises(ReferenceError):
+            len(p)
+        self.assertIsNone(r())
+
+    def test_promote_locals(self):
+        def f(x):
+            y = x * 2
+            y = y + x
+            z = y * y
+            return z + y
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        self.same(f, 3)
+        self.optimize_all(f)
+        self.same(f, 3)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f),
+            """\
+bb0:
+  %0: int 3 = LoadLocal x
+  jump bb1(s0=%0)
+bb1(%1 s0: int 3):
+  Resume
+  %2: int 2 = Const 2
+  %3: int 6 = BinaryOp * %1, %2
+  %4: int 9 = BinaryOp + %3, %1
+  %5: int 81 = BinaryOp * %4, %4
+  %6: int 90 = BinaryOp + %5, %4
+  jump bb2(s0=%6)
+  unwind [3..4) -> bb3(s0=%3)
+  unwind [4..5) -> bb4(s0=%4)
+  unwind [5..6) -> bb5(s0=%4, s1=%5)
+  origin:
+    bb0(%0 s0):
+      Resume
+      %1 = Const 2
+      %2 = BinaryOp * %0, %1
+      %3 = BinaryOp + %2, %0
+      %4 = BinaryOp * %3, %3
+      %5 = BinaryOp + %4, %3
+      leave(%5)
+      unwind [3..4) -> outer 0(%2)
+      unwind [4..5) -> outer 1(%3)
+      unwind [5..6) -> outer 2(%3, %4)
+bb2(%7 s0: int 90):
+  return %7
+bb3(%8 s0, %9 lasti, %10 exc):
+  StoreLocal y %8
+  reraise %10, lasti=%9
+bb4(%11 s0, %12 lasti, %13 exc):
+  StoreLocal y %11
+  reraise %13, lasti=%12
+bb5(%14 s0, %15 s1, %16 lasti, %17 exc):
+  StoreLocal y %14
+  StoreLocal z %15
+  reraise %17, lasti=%16
+""",
+        )
+
+    def test_hoist_loads(self):
+        # A block's first load of each local moves to its entry.
+        def f(a, b, c):
+            return a * b + c
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        self.same(f, 1, 2, 3)
+        self.optimize_all(f)
+        self.same(f, 1, 2, 3)
+        version = torch._rust.cfg_observed(f).split("  origin:")[0]
+        self.assertExpectedInline(
+            version,
+            """\
+bb0:
+  %0: int 1 = LoadLocal a
+  %1: int 2 = LoadLocal b
+  %2: int 3 = LoadLocal c
+  jump bb1(s0=%0, s1=%1, s2=%2)
+bb1(%3 s0: int 1, %4 s1: int 2, %5 s2: int 3):
+  Resume
+  %6: int 2 = BinaryOp * %3, %4
+  %7: int 5 = BinaryOp + %6, %5
+  jump bb2(s0=%7)
+""",
+        )
+
+    def test_aten_replacement(self):
+        # Operators become the aten ops they ran, guarded on the params' types
+        # and the torch-function state; when the guard fails the origin runs
+        # the Python-level operators.
+        def f(a, b, n):
+            return -(a * b + n) > 2
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        a, b = torch.tensor([1.0, 2.0]), torch.tensor([3.0, -4.0])
+        self.same(f, a, b, 1)
+        self.optimize_all(f)
+        self.same(f, a, b, 1)
+        version = torch._rust.cfg_observed(f, effects=False).split("  origin:")[0]
+        self.assertExpectedInline(
+            version,
+            """\
+bb0:
+  %0: Tensor(f32 cpu [2]) = LoadLocal a
+  %1: Tensor(f32 cpu [2]) = LoadLocal b
+  %2: int 1 = LoadLocal n
+  jump bb1(s0=%0, s1=%1, s2=%2)
+bb1(%3 s0: Tensor(f32 cpu [2]), %4 s1: Tensor(f32 cpu [2]), %5 s2: int 1):
+  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode]:
+    Resume
+    %6: Tensor(f32 cpu [2]) = Aten aten::mul.Tensor %3, %4
+    %7: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %6, %5
+    %8: Tensor(f32 cpu [2]) = Aten aten::neg %7
+    %9: int 2 = Const 2
+    %10: Tensor(b8 cpu [2]) = Aten aten::gt.Scalar %8, %9
+    outputs [%10]
+  jump bb2(s0=o0)
+""",
+        )
+
+        class Sub(torch.Tensor):
+            def __mul__(self, other):
+                return torch.zeros(2)
+
+        class Mode(torch.overrides.TorchFunctionMode):
+            calls = 0
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                Mode.calls += 1
+                return func(*args, **(kwargs or {}))
+
+        # A subclass, a float where an int was guarded, and an active mode each
+        # miss the guard, so the operators run as Python would run them.
+        self.same(f, a.as_subclass(Sub), b, 1)
+        self.same(f, a, b, 1.5)
+        with Mode():
+            torch._rust.call_with_cfg_execution(f, a, b, 1)
+        self.assertEqual(Mode.calls, 4)
+        self.same(f, a, b, 1)
+
+    def test_promote_locals_barriers(self):
+        # Stores stay pending across what Dynamo would capture (here
+        # torch.relu and Tensor.neg) and reach the frame before anything else
+        # (here locals()).
+        def f(x):
+            y = x + 1
+            d = locals()
+            y = y * 2
+            return d["y"], y
+
+        def g(x):
+            y = x + 1
+            y = torch.relu(y)
+            return y.neg()
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        self.same(f, 1)
+        self.optimize_all(f)
+        self.assertEqual(self.same(f, 1), (2, 4))
+        version = torch._rust.cfg_observed(f).split("  origin:")[0]
+        self.assertExpectedInline(
+            version,
+            """\
+bb0:
+  %0: int 1 = LoadLocal x
+  jump bb1(s0=%0)
+bb1(%1 s0: int 1):
+  Resume
+  %2: int 1 = Const 1
+  %3: int 2 = BinaryOp + %1, %2
+  %4: builtin_function_or_method = LoadGlobal locals
+  jump bb2(s0=%3, s1=%4)
+  unwind [3..4) -> bb6(s0=%3)
+""",
+        )
+        self.same(g, torch.ones(2))
+        self.optimize_all(g)
+        self.same(g, torch.ones(2))
+        # y is stored only by the landing blocks a raise goes through.
+        text = torch._rust.cfg_observed(g, effects=False, types=False)
+        self.assertExpectedInline(
+            text,
+            """\
+bb0:
+  %0 = LoadLocal x
+  jump bb1(s0=%0)
+bb1(%1 s0):
+  version [guard: plain_tensor(s0), no_torch_function_mode]:
+    Resume
+    %2 = Const 1
+    %3 = Aten aten::add.Tensor %1, %2
+    %4 = LoadGlobal torch
+    %5 = LoadAttr relu %4
+    %6 = Call 1 null, %5, %3
+    %7 = LoadMethod neg %6
+    %8 = Project 0 %7
+    %9 = Project 1 %7
+    %10 = Call 0 %8, %9
+    outputs [%10]
+    unwind [3..6) -> bb3(s0=%3)
+    unwind [6..10) -> bb4(s0=%6)
+  jump bb2(s0=o0)
+  origin:
+    bb0(%0 s0):
+      Resume
+      %1 = Const 1
+      %2 = BinaryOp + %0, %1
+      %3 = LoadGlobal torch
+      %4 = LoadAttr relu %3
+      %5 = Call 1 null, %4, %2
+      %6 = LoadMethod neg %5
+      %7 = Project 0 %6
+      %8 = Project 1 %6
+      %9 = Call 0 %7, %8
+      leave(%9)
+      unwind [3..6) -> outer 0(%2)
+      unwind [6..10) -> outer 1(%5)
+bb2(%11 s0):
+  return %11
+bb3(%12 s0, %13 lasti, %14 exc):
+  StoreLocal y %12
+  reraise %14, lasti=%13
+bb4(%15 s0, %16 lasti, %17 exc):
+  StoreLocal y %15
+  reraise %17, lasti=%16
+""",
+        )
+
+    def test_promote_locals_unwind(self):
+        # The handler, and a traceback's frame, see the locals stored before
+        # the raise.
+        def f(x, d):
+            try:
+                y = x + 1
+                y = d[y]
+                y = y * 2
+            except KeyError:
+                return -y
+            return y
+
+        def g(x):
+            y = x + 1
+            y = y * 3
+            return y // 0
+
+        self.same(f, 1, {2: 5})
+        self.optimize_all(f)
+        self.assertEqual(self.same(f, 1, {2: 5}), 10)
+        self.assertEqual(self.same(f, 1, {}), -2)
+        with self.assertRaises(ZeroDivisionError):
+            torch._rust.call_with_cfg_execution(g, 1)
+        self.optimize_all(g)
+        try:
+            torch._rust.call_with_cfg_execution(g, 1)
+            self.fail("expected ZeroDivisionError")
+        except ZeroDivisionError as e:
+            tb = e.__traceback__
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        self.assertEqual(tb.tb_frame.f_locals, {"x": 1, "y": 6})
+
+    def test_promote_locals_unbound_and_cells(self):
+        def f(xs, flag):
+            if flag:
+                y = 1
+            r = [y for y in xs]
+            del r
+            return y
+
+        def g(x):
+            y = x + 1
+            del y
+            y = 3
+            return y
+
+        def h(x):
+            x = x + 1
+            y = x * 2
+            return (lambda: x + y)()
+
+        class O:
+            def m(self, v):
+                return v + 1
+
+        # The method load is a barrier but its projections aren't: they must
+        # stay with it.
+        def k(o, x):
+            return o.m(x * 2)
+
+        for fn, args in [(f, ([4], True)), (g, (1,)), (h, (1,)), (k, (O(), 3))]:
+            self.same(fn, *args)
+            self.optimize_all(fn)
+            self.same(fn, *args)
+        with self.assertRaises(UnboundLocalError):
+            torch._rust.call_with_cfg_execution(f, [4], False)
 
     def test_tracing_is_refused(self):
         def f():

@@ -127,6 +127,10 @@ pub enum Op {
     DeleteDeref { slot: u32 },
     LoadFromDictOrDeref { slot: u32 },
     Bytecode { opcode: u8, arg: u32 },
+    // Calls an aten operator overload ("aten::add.Tensor") on the args, in
+    // schema order, other args taking their defaults. An optimized version's
+    // stand-in for the Python-level op that ran it (see cfg/optimize.rs).
+    Aten(String),
     Removed,
 }
 
@@ -165,7 +169,8 @@ impl Op {
             | Op::EvalBreaker
             | Op::LoadDeref { .. }
             | Op::DeleteDeref { .. }
-            | Op::LoadFromDictOrDeref { .. } => true,
+            | Op::LoadFromDictOrDeref { .. }
+            | Op::Aten(_) => true,
             Op::Bytecode { opcode, .. } => opcodes::generic_can_raise(*opcode),
         }
     }
@@ -241,10 +246,25 @@ pub struct UnwindSegment {
     pub handler: Handler,
 }
 
-// Conditions on a block's params, checked before any of a version runs. None
-// exist yet: they come with the optimizations that need them.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Check {}
+// Conditions checked before any of a version runs, on the block's params (by
+// position) or on global state.
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug)]
+pub enum Check {
+    // A tensor whose Python operators run as plain aten ops: exactly
+    // torch.Tensor or nn.Parameter (no __torch_function__ of its own).
+    PlainTensor(u32),
+    // Exactly this builtin type (not a subclass).
+    Exact(u32, Builtin),
+    // No __torch_function__ mode would intercept torch calls.
+    NoTorchFunctionMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Debug)]
+pub enum Builtin {
+    Int,
+    Float,
+    Bool,
+}
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Guard {
@@ -870,6 +890,7 @@ impl<'a> Printer<'a> {
             Op::DeleteDeref { slot } => format!("DeleteDeref {}", self.slot(*slot)),
             Op::LoadFromDictOrDeref { slot } => format!("LoadFromDictOrDeref {}", self.slot(*slot)),
             Op::Bytecode { opcode, arg } => format!("{} {arg}", opcodes::name(*opcode)),
+            Op::Aten(name) => format!("Aten {name}"),
             Op::Removed => "Removed".into(),
         }
     }
@@ -950,6 +971,24 @@ impl<'a> Printer<'a> {
         }
     }
 
+    // " [guard: ...]" for a non-empty guard.
+    fn guard(&self, blk: &Block, g: &Guard) -> String {
+        if g.checks.is_empty() {
+            return String::new();
+        }
+        let param = |i: &u32| blk.params.get(*i as usize).map_or("?".into(), |p| self.param_name(*p));
+        let checks: Vec<String> = g
+            .checks
+            .iter()
+            .map(|c| match c {
+                Check::PlainTensor(i) => format!("plain_tensor({})", param(i)),
+                Check::Exact(i, t) => format!("{}({})", format!("{t:?}").to_lowercase(), param(i)),
+                Check::NoTorchFunctionMode => "no_torch_function_mode".into(),
+            })
+            .collect();
+        format!(" [guard: {}]", checks.join(", "))
+    }
+
     fn unwind(&self, out: &mut String, blk: &Block, ver: &Version, indent: &str) {
         for (i, seg) in ver.unwind.iter().enumerate() {
             let to = ver.unwind.get(i + 1).map_or(ver.body.len(), |s| s.from);
@@ -992,7 +1031,7 @@ impl<'a> Printer<'a> {
                 }
                 versions => {
                     for ver in versions {
-                        let _ = writeln!(out, "{inner}version:");
+                        let _ = writeln!(out, "{inner}version{}:", self.guard(blk, &ver.guard));
                         self.body(out, ver, &deeper);
                         let _ = writeln!(out, "{deeper}outputs [{}]", self.vals(&ver.outputs));
                         self.unwind(out, blk, ver, &deeper);

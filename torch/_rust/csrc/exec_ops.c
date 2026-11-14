@@ -139,8 +139,35 @@ static PyObject* load_global(_PyInterpreterFrame* f, PyObject* name) {
   return v;
 }
 
-PyObject* tr_load_global(_PyInterpreterFrame* f, int namei) {
-  return load_global(f, co_name(f, namei));
+// A LOAD_GLOBAL's last result, valid while both dicts keep their versions
+// (globally unique, changed by every mutation), as in CPython's
+// LOAD_GLOBAL_MODULE/BUILTIN specializations. `value` is borrowed: an
+// unchanged dict still holds it.
+typedef struct {
+  PyObject* globals;
+  uint64_t globals_version;
+  PyObject* builtins;
+  uint64_t builtins_version;
+  PyObject* value;
+} tr_global_cache;
+
+PyObject* tr_load_global(_PyInterpreterFrame* f, int namei, tr_global_cache* c) {
+  PyObject* globals = f->f_globals;
+  PyObject* builtins = f->f_builtins;
+  if (c->value != NULL && c->globals == globals && c->builtins == builtins &&
+      ((PyDictObject*)globals)->ma_version_tag == c->globals_version &&
+      ((PyDictObject*)builtins)->ma_version_tag == c->builtins_version) {
+    return Py_NewRef(c->value);
+  }
+  PyObject* v = load_global(f, co_name(f, namei));
+  if (v != NULL && PyDict_CheckExact(globals) && PyDict_CheckExact(builtins)) {
+    c->globals = globals;
+    c->globals_version = ((PyDictObject*)globals)->ma_version_tag;
+    c->builtins = builtins;
+    c->builtins_version = ((PyDictObject*)builtins)->ma_version_tag;
+    c->value = v;
+  }
+  return v;
 }
 
 // Method-form LOAD_ATTR: (owner -- meth|NULL, self|attr).
@@ -160,6 +187,11 @@ int tr_load_method(_PyInterpreterFrame* f, int namei, PyObject* owner, PyObject*
 }
 
 // CALL: in = [method|NULL, self|callable, args...].
+// The function a call to `callable` runs, if it's a bound method.
+PyObject* tr_bound_function(PyObject* callable) {
+  return PyMethod_Check(callable) ? PyMethod_GET_FUNCTION(callable) : callable;
+}
+
 PyObject* tr_call(PyObject* const* in, int argc, PyObject* kwnames) {
   PyObject* callable = in[0];
   PyObject* const* args = in + 1;

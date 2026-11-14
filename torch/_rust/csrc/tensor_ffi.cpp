@@ -1,6 +1,8 @@
 #include <torch/_rust/csrc/tensor_ffi.h>
 
+#include <ATen/PythonTorchFunctionTLS.h>
 #include <torch/csrc/autograd/python_variable.h>
+#include "torch_rust/src/bindings/ffi.rs.h"
 
 // Force the linker to keep `PyInit__rust` reachable when this shim is
 // statically linked alongside the Rust crate into a larger Python extension
@@ -32,6 +34,16 @@ const Tensor* TORCH_RUST_NULLABLE tensor_from_pyobject(
   } catch (...) {
     return nullptr;
   }
+}
+
+const Tensor* TORCH_RUST_NULLABLE tensor_by_type(std::uintptr_t py_obj) noexcept {
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  PyObject* obj = reinterpret_cast<PyObject*>(py_obj);
+  if (!THPVariableClass ||
+      !PyType_IsSubtype(Py_TYPE(obj), (PyTypeObject*)THPVariableClass)) {
+    return nullptr;
+  }
+  return &THPVariable_Unpack(obj);
 }
 
 int64_t tensor_dim(const Tensor& t) {
@@ -78,6 +90,77 @@ bool tensor_defined(const Tensor& t) {
 
 bool tensor_requires_grad(const Tensor& t) {
   return t.requires_grad();
+}
+
+void tensor_meta(const Tensor& t, TensorMeta& out) noexcept {
+  out.defined = t.defined();
+  out.has_device = false;
+  out.has_shape = false;
+  out.sizes.clear();
+  if (!out.defined) {
+    return;
+  }
+  out.dtype = static_cast<int8_t>(t.scalar_type());
+  out.requires_grad = t.requires_grad();
+  const c10::TensorImpl* impl = t.unsafeGetTensorImpl();
+  if (impl->is_python_dispatch()) {
+    return;
+  }
+  try {
+    c10::Device d = t.device();
+    out.device_type = static_cast<int8_t>(d.type());
+    out.device_index = d.index();
+    out.has_device = true;
+    if (impl->has_symbolic_sizes_strides()) {
+      return;
+    }
+    for (int64_t s : t.sizes()) {
+      out.sizes.push_back(s);
+    }
+    out.has_shape = true;
+  } catch (...) {
+    // E.g. nested tensors, whose sizes() throws.
+    out.sizes.clear();
+  }
+}
+
+const char* dtype_short_name(at::ScalarType t) {
+  switch (t) {
+    case at::kFloat:
+      return "f32";
+    case at::kDouble:
+      return "f64";
+    case at::kHalf:
+      return "f16";
+    case at::kBFloat16:
+      return "bf16";
+    case at::kLong:
+      return "i64";
+    case at::kInt:
+      return "i32";
+    case at::kShort:
+      return "i16";
+    case at::kChar:
+      return "i8";
+    case at::kByte:
+      return "u8";
+    case at::kBool:
+      return "b8";
+    default:
+      return c10::toString(t);
+  }
+}
+
+bool torch_function_mode_active() {
+  return at::impl::torch_function_mode_enabled();
+}
+
+::rust::String dtype_name(int8_t dtype) {
+  return dtype_short_name(static_cast<at::ScalarType>(dtype));
+}
+
+::rust::String device_name(int8_t type, int8_t index) {
+  return c10::Device(static_cast<c10::DeviceType>(type), index).str();
 }
 
 } // namespace torch::rust

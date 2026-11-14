@@ -10,6 +10,8 @@ fn main() {
 
     let tensor_ffi_h = project_root.join("torch/_rust/csrc/tensor_ffi.h");
     let tensor_ffi_cpp = project_root.join("torch/_rust/csrc/tensor_ffi.cpp");
+    let op_hook_h = project_root.join("torch/_rust/csrc/op_hook.h");
+    let op_hook_cpp = project_root.join("torch/_rust/csrc/op_hook.cpp");
 
     // Where torch headers live. The OSS CMake build installs them under the
     // install prefix and passes that path via TORCH_RUST_INCLUDE_DIR; fall back
@@ -28,6 +30,7 @@ fn main() {
     let mut build = cxx_build::bridge("src/bindings/ffi.rs");
     build
         .file(&tensor_ffi_cpp)
+        .file(&op_hook_cpp)
         .include(project_root)
         .include(&torch_include)
         .include(&torch_csrc_api_include)
@@ -63,6 +66,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", tensor_ffi_h.display());
     println!("cargo:rerun-if-changed={}", tensor_ffi_cpp.display());
+    println!("cargo:rerun-if-changed={}", op_hook_h.display());
+    println!("cargo:rerun-if-changed={}", op_hook_cpp.display());
     // The OSS CMake build passes header/lib locations via these; re-run the
     // build script (which bakes them into the include/link search paths) when
     // they change, otherwise cargo reuses a stale cached invocation.

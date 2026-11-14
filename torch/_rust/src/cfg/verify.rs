@@ -60,6 +60,13 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
         if blk.origin.is_none() && blk.versions.last().is_none_or(|v| !v.guard.checks.is_empty()) {
             return Err(format!("bb{i}: nothing runs when every guard fails"));
         }
+        let checked = blk.versions.iter().flat_map(|v| &v.guard.checks).filter_map(|c| match c {
+            Check::PlainTensor(p) | Check::Exact(p, _) => Some(*p as usize),
+            Check::NoTorchFunctionMode => None,
+        });
+        if checked.into_iter().any(|p| p >= blk.params.len()) {
+            return Err(format!("bb{i}: a guard checks a missing param"));
+        }
         let n = blk.n_outputs();
         if blk.versions.iter().any(|v| v.outputs.len() != n) {
             return Err(format!("bb{i}: versions disagree on the number of outputs"));

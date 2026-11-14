@@ -26,6 +26,14 @@ using Tensor = at::Tensor;
 const Tensor* TORCH_RUST_NULLABLE tensor_from_pyobject(
     std::uintptr_t py_obj) noexcept;
 
+// Like tensor_from_pyobject, but by the object's type alone, so it never runs
+// Python code (isinstance can, through __instancecheck__ or a __class__
+// property).
+const Tensor* TORCH_RUST_NULLABLE tensor_by_type(std::uintptr_t py_obj) noexcept;
+
+// Whether a __torch_function__ mode would intercept torch calls.
+bool torch_function_mode_active();
+
 int64_t tensor_dim(const Tensor& t);
 int64_t tensor_numel(const Tensor& t);
 int64_t tensor_size_at(const Tensor& t, int64_t dim);
@@ -39,5 +47,19 @@ bool tensor_is_cpu(const Tensor& t);
 bool tensor_is_cuda(const Tensor& t);
 bool tensor_defined(const Tensor& t);
 bool tensor_requires_grad(const Tensor& t);
+
+// Defined by the cxx bridge (src/bindings/ffi.rs).
+struct TensorMeta;
+
+// What the CFG executor's type lattice records about a tensor, read without
+// running Python or throwing: a Python-dispatch tensor may compute its device
+// and sizes in Python, so only its dtype and requires_grad are filled in, and
+// symbolic sizes are left out.
+void tensor_meta(const Tensor& t, TensorMeta& out) noexcept;
+
+// Short dtype names (f32, i64, ...), as printed for ops and types.
+const char* dtype_short_name(at::ScalarType t);
+::rust::String dtype_name(int8_t dtype);
+::rust::String device_name(int8_t type, int8_t index);
 
 } // namespace torch::rust

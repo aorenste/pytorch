@@ -62,10 +62,15 @@ int tr_frame_owned_by_generator(_PyInterpreterFrame* f) {
   return f->owner == FRAME_OWNED_BY_GENERATOR;
 }
 
-// Points the frame at code unit `unit`, as if that instruction is executing:
-// tracebacks, f_lineno and f_lasti read this.
-void tr_frame_set_instr(_PyInterpreterFrame* f, int unit) {
-  f->prev_instr = _PyCode_CODE(f->f_code) + unit;
+// The executor points the frame at code unit `unit`, as if that instruction
+// is executing, by storing code_units + unit to prev_instr: tracebacks,
+// f_lineno and f_lasti read it.
+_Py_CODEUNIT** tr_frame_prev_instr_slot(_PyInterpreterFrame* f) {
+  return &f->prev_instr;
+}
+
+_Py_CODEUNIT* tr_frame_code_units(_PyInterpreterFrame* f) {
+  return _PyCode_CODE(f->f_code);
 }
 
 int tr_frame_get_instr(_PyInterpreterFrame* f) {
@@ -157,6 +162,15 @@ void tr_frame_exit(PyThreadState* tstate, _PyInterpreterFrame* f) {
 
 // Adds the frame to the pending exception's traceback (the default loop's
 // `error:` label). Returns -1 if that fails.
+// The innermost complete frame of the thread, or NULL.
+_PyInterpreterFrame* tr_current_frame(PyThreadState* tstate) {
+  _PyInterpreterFrame* f = tstate->cframe->current_frame;
+  while (f != NULL && _PyFrame_IsIncomplete(f)) {
+    f = f->previous;
+  }
+  return f;
+}
+
 int tr_traceback_here(_PyInterpreterFrame* f) {
   if (_PyFrame_IsIncomplete(f)) {
     return 0;
@@ -247,6 +261,7 @@ PyObject* tr_code_localsplusnames(PyCodeObject* code) {
 
 // Whether CPython's eval breaker is set: a signal, pending call, scheduled
 // GC, GIL drop request or async exception is waiting.
-int tr_eval_breaker(PyThreadState* tstate) {
-  return _Py_atomic_load_relaxed(&tstate->interp->ceval.eval_breaker) != 0;
+// The interpreter's eval-breaker flag (an _Py_atomic_int), read relaxed.
+int* tr_eval_breaker_flag(PyThreadState* tstate) {
+  return (int*)&tstate->interp->ceval.eval_breaker;
 }
