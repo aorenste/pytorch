@@ -1,11 +1,13 @@
 # Owner(s): ["module: devx"]
 
+import _thread
 import contextlib
 import dis
 import importlib
 import inspect
 import io
 import re
+import signal
 import sys
 import unittest
 
@@ -1092,6 +1094,284 @@ bb8(%24 s0, %25 lasti, %26 exc):
                 torch._rust.bytecode_to_cfg(co, simplify=False)
                 for outline in (None, "merge", "origin"):
                     torch._rust.bytecode_to_cfg(co, outline=outline)
+
+
+def _exec_tb(e):
+    out = []
+    tb = e.__traceback__
+    while tb is not None:
+        out.append(
+            (
+                tb.tb_frame.f_code.co_name,
+                tb.tb_lineno - tb.tb_frame.f_code.co_firstlineno,
+            )
+        )
+        tb = tb.tb_next
+    return out
+
+
+# Here the chains' raises unwind to handlers outside them with stack values
+# as args.
+def _cfg_outline_context():
+    context = Exception("context")
+    try:
+        raise context
+    except Exception:
+        try:
+            raise Exception("caught")
+        except Exception:
+            pass
+        try:
+            raise Exception("new")
+        except Exception as exc:
+            raised = exc
+    return raised.__context__ is context
+
+
+def _cfg_outline_tb(fn, x):
+    try:
+        fn(x)
+    except TypeError as e:
+        return _exec_tb(e)
+
+
+class _Del:
+    log = []
+
+    def __init__(self, n):
+        self.n = n
+
+    def __del__(self):
+        _Del.log.append(self.n)
+
+
+@unittest.skipIf(torch._rust is None, "torch._rust extension is not built")
+@unittest.skipIf(sys.version_info[:2] != (3, 12), "the CFG executor handles 3.12 only")
+class TestCfgExecution(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    # Runs fn both normally and under the CFG executor; results must match.
+    def same(self, fn, *args):
+        expected = fn(*args)
+        self.assertEqual(torch._rust.call_with_cfg_execution(fn, *args), expected)
+        return expected
+
+    def test_control_flow(self):
+        def f(n):
+            t = 0
+            for i in range(n):
+                if i % 3 == 0:
+                    continue
+                t += i
+            while t > 10:
+                t -= 7
+            a, *b, c = [1, 2, 3, 4]
+            return t, a, b, c, {"x": 1, "y": [i for i in range(3)]}, f"{t!r:>4}"
+
+        self.same(f, 20)
+
+    def test_exceptions_and_tracebacks(self):
+        def deep():
+            raise ValueError("boom")
+
+        def f():
+            try:
+                deep()
+            except ValueError as e:
+                tb = _exec_tb(e)
+            try:
+                try:
+                    1 / 0
+                except ZeroDivisionError as e:
+                    raise KeyError("k") from e
+            except KeyError as e:
+                chained = repr(e.__cause__)
+            finally:
+                done = sys.exception()
+            return tb, chained, done
+
+        self.assertEqual(self.same(f)[0], [("f", 2), ("deep", 1)])
+
+    def test_unbound_local_and_name_error(self):
+        def f():
+            if False:
+                y = 1
+            try:
+                return y
+            except UnboundLocalError as e:
+                msg = str(e)
+            try:
+                return undefined_name
+            except NameError as e:
+                return msg, str(e), e.name
+
+        self.same(f)
+
+    def test_generators_and_coroutines(self):
+        def f():
+            def inner():
+                r = yield 1
+                return r
+
+            def outer():
+                v = yield from inner()
+                yield v
+
+            g = outer()
+            out = [next(g), g.send("sent")]
+            gen = (x * x for x in range(4))
+
+            async def coro(x):
+                await asyncio.sleep(0)
+                return x * 2
+
+            async def agen():
+                yield 1
+                yield 2
+
+            async def main():
+                return await coro(21), [x async for x in agen()]
+
+            return out, list(gen), asyncio.run(main())
+
+        import asyncio
+
+        self.same(f)
+
+    def test_throw_into_generator_created_outside(self):
+        # The executor first sees the generator's code when the throw resumes
+        # it (as when GC closes a generator), so it builds it then.
+        src = "def gen(log):\n    try:\n        yield 1\n    finally:\n        log.append('finally')\n"
+
+        def started(log):
+            ns = {}
+            exec(src, ns)
+            g = ns["gen"](log)
+            next(g)
+            return g
+
+        def close(g):
+            g.close()
+
+        def throw(g):
+            try:
+                g.throw(ValueError("thrown"))
+            except ValueError as e:
+                return str(e)
+
+        log = []
+        run = torch._rust.call_with_cfg_execution
+        out = [run(close, started(log)), run(throw, started(log))]
+        self.assertEqual((out, log), ([None, "thrown"], ["finally", "finally"]))
+
+    def test_lifetimes(self):
+        def f():
+            _Del.log.clear()
+            _Del(1)
+            _Del.log.append("temp dropped")
+            x = _Del(2)
+            _Del.log.append("local alive")
+            x = None  # noqa: F841
+            _Del.log.append("local rebound")
+            y = _Del(3)  # noqa: F841
+            return list(_Del.log)
+
+        self.same(f)
+
+    def test_recursion_limit(self):
+        def rec(n):
+            return rec(n + 1)
+
+        def f():
+            try:
+                rec(0)
+            except RecursionError as e:
+                return str(e)
+
+        self.same(f)
+
+    def test_pep695_intrinsics(self):
+        ns = {}
+        src = "def f[T, *Ts, **P](x: T) -> T:\n    return x\ntype Alias[K] = list[K]\n"
+        exec(src, ns)
+
+        def g():
+            p = ns["f"].__type_params__
+            return [(type(t).__name__, t.__name__) for t in p], ns["Alias"].__value__
+
+        self.same(g)
+
+    def test_eval_breaker_on_generator_resume(self):
+        class Boom(Exception):
+            pass
+
+        def handler(*args):
+            raise Boom
+
+        def f():
+            def g():
+                yield 0
+                try:
+                    yield 1
+                except Boom:
+                    yield "caught"
+
+            it = g()
+            next(it)
+            next(it)
+            # zip calls interrupt_main (which only trips the signal) and then
+            # resumes g from C, so g's RESUME is the first eval-breaker check.
+            return list(zip(map(_thread.interrupt_main, [signal.SIGUSR1]), it))
+
+        old = signal.signal(signal.SIGUSR1, handler)
+        try:
+            self.assertEqual(self.same(f), [(None, "caught")])
+        finally:
+            signal.signal(signal.SIGUSR1, old)
+
+    def test_outlined_execution(self):
+        class A:
+            a = 1
+
+        class B:
+            b = 2
+
+        class K:
+            @property
+            def b(self):
+                raise KeyError
+
+        class T:
+            @property
+            def b(self):
+                raise TypeError("t")
+
+        # Fresh code objects: the executor caches each one's CFG.
+        def fresh(f):
+            return type(f)(f.__code__.replace(co_name=f.__name__), f.__globals__)
+
+        for mode in ("merge", "origin"):
+            fn = fresh(_cfg_outline)
+            torch._rust._set_cfg_outline(mode)
+            try:
+                for x in (A(), B(), K()):
+                    self.same(fn, x)
+                self.same(_cfg_outline_tb, fn, T())
+                self.assertTrue(self.same(fresh(_cfg_outline_context)))
+            finally:
+                torch._rust._set_cfg_outline(None)
+
+    def test_tracing_is_refused(self):
+        def f():
+            sys.settrace(lambda *a: None)
+            try:
+                return (lambda: 1)()
+            finally:
+                sys.settrace(None)
+
+        with self.assertRaisesRegex(RuntimeError, "settrace"):
+            torch._rust.call_with_cfg_execution(f)
+        sys.settrace(None)
 
 
 if __name__ == "__main__":

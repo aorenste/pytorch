@@ -55,7 +55,7 @@ impl fmt::Display for CfgError {
 pub fn build(info: bytecode::CodeInfo, simplify: bool, outline: Option<outline::Outline>) -> Result<ir::Cfg, CfgError> {
     let dec = bytecode::decode(&info)?;
     let part = blocks::partition(&dec)?;
-    let cfg = ir::Cfg::new(info.slot_names(), info.const_reprs, info.names);
+    let cfg = ir::Cfg::new(info.slot_names, info.const_reprs, info.names);
     let mut cfg = interp::interpret(cfg, &dec, &part)?;
     if cfg!(debug_assertions) || !simplify {
         verify::verify(&cfg).map_err(CfgError::Verify)?;

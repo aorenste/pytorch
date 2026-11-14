@@ -36,7 +36,7 @@ fn main() {
         // method stubs); silence them so they don't drown out real ones.
         .flag_if_supported("-Wno-unused-parameter")
         .std("c++20");
-    if let Ok(out) = python_includes {
+    if let Ok(out) = &python_includes {
         for line in out.lines() {
             let path = line.trim();
             if !path.is_empty() {
@@ -45,6 +45,21 @@ fn main() {
         }
     }
     build.compile("torch_rust_tensor_ffi");
+
+    // CPython-internal frame helpers for the CFG executor. Plain C: the 3.12
+    // internal headers don't compile as C++.
+    let shim_srcs = ["frame_shim.c", "exec_ops.c"].map(|f| project_root.join("torch/_rust/csrc").join(f));
+    let mut shim = cc::Build::new();
+    shim.files(&shim_srcs).flag_if_supported("-Wno-unused-parameter");
+    if let Ok(out) = &python_includes {
+        for path in out.lines().map(str::trim).filter(|p| !p.is_empty()) {
+            shim.include(path);
+        }
+    }
+    shim.compile("torch_rust_frame_shim");
+    for src in &shim_srcs {
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
 
     println!("cargo:rerun-if-changed={}", tensor_ffi_h.display());
     println!("cargo:rerun-if-changed={}", tensor_ffi_cpp.display());

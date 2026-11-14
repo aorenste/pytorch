@@ -1,0 +1,66 @@
+// Declarations for csrc/frame_shim.c, csrc/exec_ops.c and the CPython APIs
+// pyo3::ffi doesn't cover.
+
+use std::os::raw::{c_int, c_void};
+
+use pyo3::ffi::{PyObject, PyThreadState};
+
+#[repr(C)]
+pub struct Frame {
+    _private: [u8; 0],
+}
+
+pub type EvalFrameFn = unsafe extern "C" fn(*mut PyThreadState, *mut Frame, c_int) -> *mut PyObject;
+
+extern "C" {
+    // frame_shim.c
+    pub fn tr_frame_code(f: *mut Frame) -> *mut PyObject;
+    pub fn tr_frame_localsplus(f: *mut Frame) -> *mut *mut PyObject;
+    pub fn tr_frame_func(f: *mut Frame) -> *mut PyObject;
+    pub fn tr_frame_owned_by_generator(f: *mut Frame) -> c_int;
+    pub fn tr_frame_set_instr(f: *mut Frame, unit: c_int);
+    pub fn tr_frame_get_instr(f: *mut Frame) -> c_int;
+    pub fn tr_frame_nlocalsplus(f: *mut Frame) -> c_int;
+    pub fn tr_frame_enter(t: *mut PyThreadState, f: *mut Frame) -> c_int;
+    pub fn tr_frame_exit(t: *mut PyThreadState, f: *mut Frame);
+    pub fn tr_frame_clear_and_pop(t: *mut PyThreadState, f: *mut Frame);
+    pub fn tr_traceback_here(f: *mut Frame) -> c_int;
+    pub fn tr_tracing_active(t: *mut PyThreadState) -> c_int;
+    pub fn tr_frame_push(f: *mut Frame, obj: *mut PyObject);
+    pub fn tr_frame_pop(f: *mut Frame) -> *mut PyObject;
+    pub fn tr_frame_stack_depth(f: *mut Frame) -> c_int;
+    pub fn tr_gen_suspend(t: *mut PyThreadState, f: *mut Frame, unit: c_int);
+    pub fn tr_gen_exit(t: *mut PyThreadState, f: *mut Frame);
+    pub fn tr_code_localsplusnames(code: *mut PyObject) -> *mut PyObject;
+    pub fn tr_eval_breaker(t: *mut PyThreadState) -> c_int;
+
+    // exec_ops.c
+    pub fn tr_unbound_local(f: *mut Frame, slot: c_int);
+    pub fn tr_unbound_deref(f: *mut Frame, slot: c_int);
+    pub fn tr_load_global(f: *mut Frame, namei: c_int) -> *mut PyObject;
+    pub fn tr_load_method(f: *mut Frame, namei: c_int, owner: *mut PyObject, out: *mut *mut PyObject) -> c_int;
+    pub fn tr_call(args: *const *mut PyObject, argc: c_int, kwnames: *mut PyObject) -> *mut PyObject;
+    pub fn tr_binary_op(op: c_int, lhs: *mut PyObject, rhs: *mut PyObject) -> *mut PyObject;
+    pub fn tr_make_function(f: *mut Frame, flags: c_int, args: *const *mut PyObject) -> *mut PyObject;
+    pub fn tr_load_from_dict_or_deref(f: *mut Frame, class_dict: *mut PyObject, slot: c_int) -> *mut PyObject;
+    pub fn tr_do_raise(exc: *mut PyObject, cause: *mut PyObject) -> c_int;
+    pub fn tr_send(receiver: *mut PyObject, v: *mut PyObject, out: *mut *mut PyObject) -> c_int;
+    pub fn tr_generic(
+        f: *mut Frame,
+        opcode: c_int,
+        oparg: c_int,
+        args: *const *mut PyObject,
+        out: *mut *mut PyObject,
+    ) -> c_int;
+
+    // CPython
+    pub fn _PyInterpreterState_GetEvalFrameFunc(interp: *mut pyo3::ffi::PyInterpreterState) -> EvalFrameFn;
+    pub fn _PyInterpreterState_SetEvalFrameFunc(interp: *mut pyo3::ffi::PyInterpreterState, f: EvalFrameFn);
+    pub fn PyUnstable_Eval_RequestCodeExtraIndex(free: unsafe extern "C" fn(*mut c_void)) -> isize;
+    pub fn PyUnstable_Code_GetExtra(code: *mut PyObject, index: isize, extra: *mut *mut c_void) -> c_int;
+    pub fn PyUnstable_Code_SetExtra(code: *mut PyObject, index: isize, extra: *mut c_void) -> c_int;
+    pub fn PyFunction_GetClosure(func: *mut PyObject) -> *mut PyObject;
+    pub fn PyCell_New(obj: *mut PyObject) -> *mut PyObject;
+    pub fn PyCell_Get(cell: *mut PyObject) -> *mut PyObject;
+    pub fn PyCell_Set(cell: *mut PyObject, value: *mut PyObject) -> c_int;
+}

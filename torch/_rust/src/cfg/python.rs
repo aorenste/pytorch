@@ -6,6 +6,7 @@ use pyo3::types::PyBytes;
 
 use super::bytecode::CodeInfo;
 use super::outline::Outline;
+use crate::exec::ffi::tr_code_localsplusnames;
 use super::{build, opcodes, CfgError};
 
 fn strings(code: &Bound<'_, PyAny>, attr: &str) -> PyResult<Vec<String>> {
@@ -17,6 +18,9 @@ fn bytes(code: &Bound<'_, PyAny>, attr: &str) -> PyResult<Vec<u8>> {
 }
 
 pub fn code_info(code: &Bound<'_, PyAny>) -> PyResult<CodeInfo> {
+    if !code.is_instance_of::<pyo3::types::PyCode>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err("expected a code object"));
+    }
     let mut const_reprs = vec![];
     for c in code.getattr("co_consts")?.try_iter()? {
         let c = c?;
@@ -32,9 +36,10 @@ pub fn code_info(code: &Bound<'_, PyAny>) -> PyResult<CodeInfo> {
         exception_table: bytes(code, "co_exceptiontable")?,
         const_reprs,
         names: strings(code, "co_names")?,
-        varnames: strings(code, "co_varnames")?,
-        cellvars: strings(code, "co_cellvars")?,
-        freevars: strings(code, "co_freevars")?,
+        slot_names: unsafe {
+            let names = tr_code_localsplusnames(code.as_ptr());
+            Bound::from_borrowed_ptr(code.py(), names).extract()?
+        },
     })
 }
 

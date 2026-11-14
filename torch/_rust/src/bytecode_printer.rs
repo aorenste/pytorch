@@ -12,23 +12,12 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-#[repr(C)]
-struct InterpreterFrame {
-    _private: [u8; 0],
-}
-
-type EvalFrameFn = unsafe extern "C" fn(
-    *mut ffi::PyThreadState,
-    *mut InterpreterFrame,
-    c_int,
-) -> *mut ffi::PyObject;
+use crate::exec::ffi::{
+    EvalFrameFn, Frame as InterpreterFrame, _PyInterpreterState_GetEvalFrameFunc,
+    _PyInterpreterState_SetEvalFrameFunc,
+};
 
 extern "C" {
-    fn _PyInterpreterState_GetEvalFrameFunc(interp: *mut ffi::PyInterpreterState) -> EvalFrameFn;
-    fn _PyInterpreterState_SetEvalFrameFunc(
-        interp: *mut ffi::PyInterpreterState,
-        eval_frame: EvalFrameFn,
-    );
     fn PyUnstable_InterpreterFrame_GetCode(frame: *mut InterpreterFrame) -> *mut ffi::PyObject;
 }
 

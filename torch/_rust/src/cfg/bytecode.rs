@@ -11,24 +11,9 @@ pub struct CodeInfo {
     pub exception_table: Vec<u8>,
     pub const_reprs: Vec<String>,
     pub names: Vec<String>,
-    pub varnames: Vec<String>,
-    pub cellvars: Vec<String>,
-    pub freevars: Vec<String>,
-}
-
-impl CodeInfo {
-    // co_localsplusnames order: varnames, cellvars not already in varnames, freevars.
-    pub fn slot_names(&self) -> Vec<String> {
-        let mut names = self.varnames.clone();
-        names.extend(
-            self.cellvars
-                .iter()
-                .filter(|c| !self.varnames.contains(c))
-                .cloned(),
-        );
-        names.extend(self.freevars.iter().cloned());
-        names
-    }
+    // co_localsplusnames: varnames, then cellvars not in varnames, then
+    // freevars.
+    pub slot_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
