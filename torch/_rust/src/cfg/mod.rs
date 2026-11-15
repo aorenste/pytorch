@@ -12,6 +12,7 @@ pub mod ir;
 pub mod opcodes;
 pub mod optimize;
 pub mod outline;
+pub mod partition;
 pub mod python;
 pub mod simplify;
 pub mod verify;

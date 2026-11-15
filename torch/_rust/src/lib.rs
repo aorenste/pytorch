@@ -74,6 +74,14 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(exec::_set_cfg_record, m)?)?;
     m.add_function(wrap_pyfunction!(exec::cfg_observed, m)?)?;
     m.add_function(wrap_pyfunction!(exec::optimize_block, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_add_block_checks, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_cfg_misses, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::graph::_run_aten_graph, m)?)?;
+    m.add_class::<exec::graph::Ref>()?;
+    m.add_function(wrap_pyfunction!(exec::joint::_trace_joint, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::autograd::_set_cfg_autograd, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::autograd::_cfg_last_joint, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_cfg_autograd_blocks, m)?)?;
     m.add_function(wrap_pyfunction!(exec::torch_ops::set_print_torch_ops, m)?)?;
     m.add_function(wrap_pyfunction!(cfg::python::_cfg_opcodes, m)?)?;
     m.add_function(wrap_pyfunction!(cfg::python::_cfg_signature, m)?)?;

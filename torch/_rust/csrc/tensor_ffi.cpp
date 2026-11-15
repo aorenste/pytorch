@@ -1,6 +1,10 @@
 #include <torch/_rust/csrc/tensor_ffi.h>
 
 #include <ATen/PythonTorchFunctionTLS.h>
+#include <ATen/SavedTensorHooks.h>
+#include <ATen/core/grad_mode.h>
+#include <c10/core/AutogradState.h>
+#include <torch/csrc/autograd/forward_grad.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include "torch_rust/src/bindings/ffi.rs.h"
 
@@ -39,7 +43,7 @@ const Tensor* TORCH_RUST_NULLABLE tensor_from_pyobject(
 const Tensor* TORCH_RUST_NULLABLE tensor_by_type(std::uintptr_t py_obj) noexcept {
   // NOLINTNEXTLINE(performance-no-int-to-ptr)
   PyObject* obj = reinterpret_cast<PyObject*>(py_obj);
-  if (!THPVariableClass ||
+  if (!obj || !THPVariableClass ||
       !PyType_IsSubtype(Py_TYPE(obj), (PyTypeObject*)THPVariableClass)) {
     return nullptr;
   }
@@ -96,6 +100,7 @@ void tensor_meta(const Tensor& t, TensorMeta& out) noexcept {
   out.defined = t.defined();
   out.has_device = false;
   out.has_shape = false;
+  out.strided = false;
   out.sizes.clear();
   if (!out.defined) {
     return;
@@ -118,6 +123,7 @@ void tensor_meta(const Tensor& t, TensorMeta& out) noexcept {
       out.sizes.push_back(s);
     }
     out.has_shape = true;
+    out.strided = t.layout() == c10::kStrided;
   } catch (...) {
     // E.g. nested tensors, whose sizes() throws.
     out.sizes.clear();
@@ -153,6 +159,60 @@ const char* dtype_short_name(at::ScalarType t) {
 
 bool torch_function_mode_active() {
   return at::impl::torch_function_mode_enabled();
+}
+
+bool grad_mode_enabled() {
+  return at::GradMode::is_enabled();
+}
+
+bool set_grad_mode(bool on) {
+  bool prev = at::GradMode::is_enabled();
+  at::GradMode::set_enabled(on);
+  return prev;
+}
+
+int64_t tensor_version(const Tensor& t) {
+  return t._version();
+}
+
+bool forward_ad_active() {
+  return torch::autograd::ForwardADLevel::has_any_level() &&
+      c10::AutogradState::get_tls_state().get_fw_grad_mode();
+}
+
+bool saved_tensor_hooks_active() {
+  return at::SavedTensorDefaultHooks::get_hooks().has_value();
+}
+
+bool functorch_active() {
+  // functorch includes it while its transform stack isn't empty.
+  return c10::impl::tls_is_dispatch_key_included(
+      c10::DispatchKey::FuncTorchDynamicLayerFrontMode);
+}
+
+bool tensor_matches(
+    const Tensor& t,
+    int8_t dtype,
+    int8_t device_type,
+    int8_t device_index,
+    ::rust::Slice<const int64_t> sizes,
+    ::rust::Slice<const int64_t> strides) noexcept {
+  const c10::TensorImpl* impl = t.unsafeGetTensorImpl();
+  if (!t.defined() || impl->is_python_dispatch() ||
+      impl->has_symbolic_sizes_strides() || t.is_nested() ||
+      t.layout() != c10::kStrided ||
+      static_cast<int8_t>(t.scalar_type()) != dtype) {
+    return false;
+  }
+  c10::Device d = t.device();
+  if (static_cast<int8_t>(d.type()) != device_type ||
+      d.index() != device_index) {
+    return false;
+  }
+  auto sz = t.sizes();
+  auto st = t.strides();
+  return std::equal(sz.begin(), sz.end(), sizes.begin(), sizes.end()) &&
+      std::equal(st.begin(), st.end(), strides.begin(), strides.end());
 }
 
 ::rust::String dtype_name(int8_t dtype) {

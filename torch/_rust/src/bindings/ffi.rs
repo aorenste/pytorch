@@ -7,6 +7,7 @@
 #[cxx::bridge(namespace = "torch::rust")]
 pub mod ffi {
     // See tensor_meta in tensor_ffi.h. The device and dtype are c10's enums.
+    #[derive(Default)]
     struct TensorMeta {
         defined: bool,
         dtype: i8,
@@ -16,6 +17,8 @@ pub mod ffi {
         device_index: i8,
         has_shape: bool,
         sizes: Vec<i64>,
+        // Strided layout: strides() exists (it throws for sparse layouts).
+        strided: bool,
     }
 
     unsafe extern "C++" {
@@ -27,6 +30,20 @@ pub mod ffi {
         unsafe fn tensor_by_type(py_obj: usize) -> *const Tensor;
 
         fn torch_function_mode_active() -> bool;
+        fn grad_mode_enabled() -> bool;
+        fn set_grad_mode(on: bool) -> bool;
+        fn tensor_version(t: &Tensor) -> i64;
+        fn forward_ad_active() -> bool;
+        fn saved_tensor_hooks_active() -> bool;
+        fn functorch_active() -> bool;
+        fn tensor_matches(
+            t: &Tensor,
+            dtype: i8,
+            device_type: i8,
+            device_index: i8,
+            sizes: &[i64],
+            strides: &[i64],
+        ) -> bool;
         fn tensor_dim(t: &Tensor) -> i64;
         fn tensor_numel(t: &Tensor) -> i64;
         fn tensor_size_at(t: &Tensor, dim: i64) -> i64;
@@ -54,6 +71,7 @@ pub mod op_hook {
 
         fn op_hook_enable();
         fn op_hook_disable();
+        fn op_hook_pause(paused: bool);
     }
 
     extern "Rust" {
@@ -61,6 +79,26 @@ pub mod op_hook {
     }
 }
 
+#[cxx::bridge(namespace = "torch::rust")]
+pub mod autograd {
+    extern "Rust" {
+        type NodeState;
+        // See CfgBackward in autograd_node.cpp: `grads` holds borrowed
+        // PyObject*s (a tensor, or None), `out` gets a new reference per
+        // input (a tensor, or None). False with a Python exception set on
+        // failure.
+        fn node_apply(state: &mut NodeState, grads: &[usize], out: &mut Vec<usize>) -> bool;
+        fn node_release(state: &mut NodeState);
+    }
+
+    unsafe extern "C++" {
+        include!("torch/_rust/csrc/autograd_node.h");
+
+        unsafe fn make_cfg_node(state: Box<NodeState>, inputs: &[usize], outputs: &[usize], wrapped: &mut Vec<usize>) -> bool;
+    }
+}
+
+use crate::exec::autograd::{node_apply, node_release, NodeState};
 use crate::exec::torch_ops::on_torch_op;
 
 pub use self::ffi::*;

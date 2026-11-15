@@ -3,6 +3,7 @@
 import _thread
 import contextlib
 import dis
+import functools
 import gc
 import importlib
 import inspect
@@ -15,6 +16,7 @@ import unittest
 import weakref
 
 import torch
+import torch.nn.functional as F
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     run_tests,
@@ -1631,7 +1633,7 @@ bb2(%6 s0: Tensor(f32 cpu [2])):
   version [guard: plain_tensor(s0), no_torch_function_mode]:
     %7: int 1 = Const 1
     %8: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %6, %7
-        effects [2 visits]:
+        effects [1 visit]:
           torch aten::add.Tensor(f32[2], i64[], alpha=1)
     outputs [%8]
   jump bb3(s0=o0)
@@ -1640,7 +1642,7 @@ bb2(%6 s0: Tensor(f32 cpu [2])):
       %1 = Const 1
       %2 = BinaryOp + %0, %1
       leave(%2)
-bb3(%9 s0: Tensor(f32 cpu [2])):
+bb3(%9 s0):
   StoreLocal y %9
   jump bb4
 bb4:
@@ -1675,6 +1677,97 @@ bb4:
         self.assertEqual(torch._rust.call_with_cfg_execution(list, g), [8])
 
     # Optimizes every block of fn that can be.
+    def test_optimized_stops_recording(self):
+        # Once every block was offered to the optimizer, frames record nothing
+        # (here the int at bb0's LoadLocal), except in origins run on a miss.
+        def f(x):
+            y = x * 2
+            return y + 1
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        torch._rust._set_cfg_optimize(True)
+        try:
+            for _ in range(3):
+                torch._rust.call_with_cfg_execution(f, torch.ones(2))
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, 3), 7)
+        finally:
+            torch._rust._set_cfg_optimize(False)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f),
+            """\
+bb0:
+  %0: Tensor(f32 cpu [2]) = LoadLocal x
+  jump bb1(s0=%0)
+bb1(%1 s0):
+  version [guard: plain_tensor(s0), no_torch_function_mode]:
+    Resume
+    %2: int 2 = Const 2
+    %3: Tensor(f32 cpu [2]) = Aten aten::mul.Tensor %1, %2
+        effects [1 visit]:
+          torch aten::mul.Tensor(f32[2], i64[])
+    %4: int 1 = Const 1
+    %5: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %3, %4
+        effects [1 visit]:
+          torch aten::add.Tensor(f32[2], i64[], alpha=1)
+    outputs [%5]
+    unwind [4..5) -> bb3(s0=%3)
+  jump bb2(s0=o0)
+  origin:
+    bb0(%0 s0):
+      Resume
+      %1: int 2 = Const 2
+      %2: int 6 = BinaryOp * %0, %1
+      %3: int 1 = Const 1
+      %4: int 7 = BinaryOp + %2, %3
+      leave(%4)
+      unwind [4..5) -> outer 0(%2)
+bb2(%6 s0):
+  return %6
+bb3(%7 s0, %8 lasti, %9 exc):
+  StoreLocal y %7
+  reraise %9, lasti=%8
+""",
+        )
+
+    def test_effects_vary(self):
+        # A site keeps 8 distinct effect sequences.
+        def f(x):
+            return x + 1
+
+        code = f.__code__.replace(co_name="f")
+        f = type(f)(code, f.__globals__)
+        for n in range(10):
+            torch._rust.call_with_cfg_execution(f, torch.ones(n))
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f),
+            """\
+bb0:
+  Resume
+  %0: Tensor(f32 cpu [0..9]) = LoadLocal x
+  %1: int 1 = Const 1
+  %2: Tensor(f32 cpu [0..9]) = BinaryOp + %0, %1
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[0], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[1], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[2], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[3], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[4], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[5], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[6], i64[], alpha=1)
+      effects [1 visit]:
+        torch aten::add.Tensor(f32[7], i64[], alpha=1)
+      effects vary (more sequences than kept)
+  return %2
+""",
+        )
+
     def optimize_all(self, fn):
         b = 0
         while True:
@@ -1750,7 +1843,7 @@ bb1(%1 s0: int 3):
       unwind [3..4) -> outer 0(%2)
       unwind [4..5) -> outer 1(%3)
       unwind [5..6) -> outer 2(%3, %4)
-bb2(%7 s0: int 90):
+bb2(%7 s0):
   return %7
 bb3(%8 s0, %9 lasti, %10 exc):
   StoreLocal y %8
@@ -1847,6 +1940,828 @@ bb1(%3 s0: Tensor(f32 cpu [2]), %4 s1: Tensor(f32 cpu [2]), %5 s2: int 1):
         self.assertEqual(Mode.calls, 4)
         self.same(f, a, b, 1)
 
+    def test_guard_checks(self):
+        # Each check misses (running the origin) exactly when its condition
+        # fails.
+        def f(a, b, n):
+            return a * b + n
+
+        a, b = torch.randn(2, 3), torch.randn(2, 3)
+        self.same(f, a, b, 1)
+        self.optimize_all(f)
+        checks = [
+            ("grad_enabled", True),
+            ("requires_grad", 0, False),
+            ("tensor", 0, a),
+            ("value", 2, 1),
+            ("no_forward_ad",),
+            ("no_saved_tensor_hooks",),
+        ]
+        torch._rust._add_block_checks(f, 1, checks)
+        version = torch._rust.cfg_observed(f, effects=False, types=False).split(
+            "  origin:"
+        )[0]
+        self.assertExpectedInline(
+            version,
+            """\
+bb0:
+  %0 = LoadLocal a
+  %1 = LoadLocal b
+  %2 = LoadLocal n
+  jump bb1(s0=%0, s1=%1, s2=%2)
+bb1(%3 s0, %4 s1, %5 s2):
+  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode, grad_enabled, no_requires_grad(s0), tensor(s0 f32 cpu [2, 3] stride [3, 1]), value(s2 == 1), no_forward_ad, no_saved_tensor_hooks]:
+    Resume
+    %6 = Aten aten::mul.Tensor %3, %4
+    %7 = Aten aten::add.Tensor %6, %5
+    outputs [%7]
+  jump bb2(s0=o0)
+""",
+        )
+
+        def misses(*args):
+            before = torch._rust._cfg_misses(f)[1]
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, *args), f(*args))
+            return torch._rust._cfg_misses(f)[1] - before
+
+        self.assertEqual(misses(a, b, 1), 0)
+        with torch.no_grad():
+            self.assertEqual(misses(a, b, 1), 1)
+        self.assertEqual(misses(a.clone().requires_grad_(), b, 1), 1)
+        self.assertEqual(misses(torch.randn(3, 2), torch.randn(3, 2), 1), 1)
+        self.assertEqual(misses(torch.randn(3, 2).t(), b, 1), 1)
+        self.assertEqual(misses(a.double(), b.double(), 1), 1)
+        self.assertEqual(misses(a, b, 2), 1)
+        self.assertEqual(misses(a, b, True), 1)
+        with torch.autograd.forward_ad.dual_level():
+            self.assertEqual(misses(a, b, 1), 1)
+        with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+            self.assertEqual(misses(a, b, 1), 1)
+        self.assertEqual(misses(a, b, 1), 0)
+
+    def test_optimized_grads_match_eager(self):
+        # Replaced operators still run through autograd, with grad on or off
+        # and whichever inputs require grad.
+        def f(a, b, c):
+            return ((a * b + c) @ b.t() - a).sum()
+
+        def grads(fn, run, *args):
+            args = [x.clone().requires_grad_(rg) for x, rg in args]
+            out = run(fn, *args)
+            if not out.requires_grad:
+                return out, []
+            out.backward()
+            return out, [x.grad for x in args]
+
+        x, y, z = (torch.randn(3, 3) for _ in range(3))
+        self.same(f, x, y, z)
+        self.optimize_all(f)
+        self.assertIn(
+            "Aten aten::mul.Tensor",
+            torch._rust.cfg_observed(f, effects=False, types=False),
+        )
+        eager = lambda fn, *args: fn(*args)  # noqa: E731
+        for rgs in [
+            (True, True, True),
+            (True, False, False),
+            (False, False, True),
+            (False, False, False),
+        ]:
+            args = list(zip((x, y, z), rgs))
+            self.assertEqual(
+                grads(f, torch._rust.call_with_cfg_execution, *args),
+                grads(f, eager, *args),
+            )
+            with torch.no_grad():
+                self.assertEqual(
+                    grads(f, torch._rust.call_with_cfg_execution, *args),
+                    grads(f, eager, *args),
+                )
+
+    def test_aten_graph(self):
+        # An op list becomes a graph of aten ops: kwargs by name, literals
+        # (deduplicated), lists of values built at run time, and multi-output
+        # ops (tuples and Tensor[]) through Projects. It runs without a frame.
+        from torch._rust import Ref
+
+        x, w = torch.randn(4, 3), torch.randn(3)
+        ops = [
+            ("aten::mul.Tensor", (Ref(0), Ref(1)), {}, None),
+            ("aten::add.Tensor", (Ref(2), 1.5), {"alpha": 2}, None),
+            ("aten::var_mean.correction", (Ref(3), [1]), {"keepdim": True}, 2),
+            ("aten::split.Tensor", (Ref(3), 2), {}, 2),
+            ("aten::cat", ([Ref(6), Ref(7)], 0), {}, None),
+            (
+                "aten::sum.dim_IntList",
+                (Ref(8), [0], False),
+                {"dtype": torch.float64},
+                None,
+            ),
+            (
+                "aten::zeros",
+                ([2, 2],),
+                {
+                    "dtype": torch.float32,
+                    "layout": torch.strided,
+                    "device": torch.device("cpu"),
+                },
+                None,
+            ),
+        ]
+        text, outs = torch._rust._run_aten_graph(
+            2, ops, [Ref(4), Ref(5), Ref(8), Ref(9), Ref(10)], [x, w]
+        )
+        self.assertExpectedInline(
+            text,
+            """\
+bb0(%0 s0, %1 s1):
+  %2 = Aten aten::mul.Tensor %0, %1
+  %3 = Lit 1.5
+  %4 = Lit 2
+  %5 = Aten aten::add.Tensor kw[alpha] %2, %3, %4
+  %6 = Lit [1]
+  %7 = Lit True
+  %8 = Aten aten::var_mean.correction kw[keepdim] %5, %6, %7
+  %9 = Project 0 %8
+  %10 = Project 1 %8
+  %11 = Aten aten::split.Tensor %5, %4
+  %12 = Project 0 %11
+  %13 = Project 1 %11
+  %14 = BuildTuple 2 %12, %13
+  %15 = Lit 0
+  %16 = Aten aten::cat %14, %15
+  %17 = Lit [0]
+  %18 = Lit False
+  %19 = Lit torch.float64
+  %20 = Aten aten::sum.dim_IntList kw[dtype] %16, %17, %18, %19
+  %21 = Lit [2, 2]
+  %22 = Lit torch.float32
+  %23 = Lit torch.strided
+  %24 = Lit device("cpu")
+  %25 = Aten aten::zeros kw[dtype, layout, device] %21, %22, %23, %24
+  leave(%9, %10, %16, %20, %25)
+""",
+        )
+        t = torch.add(x * w, 1.5, alpha=2)
+        cat = torch.cat(t.split(2))
+        self.assertEqual(
+            outs,
+            (
+                *torch.var_mean(t, [1], keepdim=True),
+                cat,
+                cat.sum([0], dtype=torch.float64),
+                torch.zeros(2, 2),
+            ),
+        )
+
+        mm = [("aten::mm", (Ref(0), Ref(0)), {}, None)]
+        with self.assertRaisesRegex(RuntimeError, "cannot be multiplied"):
+            torch._rust._run_aten_graph(1, mm, [Ref(1)], [torch.randn(2, 3)])
+        with self.assertRaisesRegex(ValueError, "not defined yet"):
+            torch._rust._run_aten_graph(1, mm, [Ref(2)], [torch.randn(2, 3)])
+        with self.assertRaisesRegex(ValueError, "as a literal"):
+            torch._rust._run_aten_graph(
+                1, [("aten::mul.Tensor", (Ref(0), object()), {}, None)], [Ref(1)], [x]
+            )
+
+    def test_joint_graph(self):
+        # The forward and backward ops below Autograd as one graph: tensors
+        # autograd saved (sigmoid's and exp's outputs) map back to the values
+        # that made them, and an in-place op on an intermediate becomes its
+        # out-of-place overload.
+        def f(x, w, c):
+            y = (x @ w).sigmoid()
+            z = y * c
+            z.add_(1)
+            return z.exp().sum(), y
+
+        x, w, c = (
+            torch.randn(4, 3, requires_grad=True),
+            torch.randn(3, 5, requires_grad=True),
+            torch.randn(4, 5),
+        )
+        self.assertExpectedInline(
+            torch._rust._trace_joint(f, x, w, c),
+            """\
+# 3 inputs, 2 tangents, 2 outputs; the first 9 instrs are the forward
+bb0(%0 s0, %1 s1, %2 s2, %3 s3, %4 s4):
+  %5 = Aten aten::mm %0, %1
+  %6 = Aten aten::sigmoid %5
+  %7 = Aten aten::detach %6
+  %8 = Aten aten::mul.Tensor %6, %2
+  %9 = Lit 1
+  %10 = Aten aten::add.Tensor %8, %9
+  %11 = Aten aten::exp %10
+  %12 = Aten aten::detach %11
+  %13 = Aten aten::sum %11
+  %14 = Lit [4, 5]
+  %15 = Aten aten::expand %3, %14
+  %16 = Aten aten::detach %12
+  %17 = Aten aten::mul.Tensor %15, %16
+  %18 = Aten aten::mul.Tensor %17, %2
+  %19 = Aten aten::add.Tensor %4, %18
+  %20 = Aten aten::detach %7
+  %21 = Aten aten::sigmoid_backward %19, %20
+  %22 = Aten aten::t %0
+  %23 = Aten aten::mm %22, %21
+  %24 = Aten aten::t %1
+  %25 = Aten aten::mm %21, %24
+  leave(%13, %6, %25, %23)
+""",
+        )
+        self.assertExpectedInline(
+            torch._rust._trace_joint(lambda x: torch.softmax(x, -1).relu(), x),
+            """\
+# 1 inputs, 1 tangents, 1 outputs; the first 6 instrs are the forward
+bb0(%0 s0, %1 s1):
+  %2 = Lit -1
+  %3 = Lit False
+  %4 = Aten aten::_softmax %0, %2, %3
+  %5 = Aten aten::detach %4
+  %6 = Aten aten::relu %4
+  %7 = Aten aten::detach %6
+  %8 = Aten aten::detach %7
+  %9 = Lit 0
+  %10 = Aten aten::threshold_backward %1, %8, %9
+  %11 = Aten aten::detach %5
+  %12 = Lit torch.float32
+  %13 = Aten aten::_softmax_backward_data %10, %11, %2, %12
+  leave(%6, %13)
+""",
+        )
+
+        def mutate_view(x):
+            y = x * 2
+            y.view(-1).add_(1)
+            return y
+
+        def mutate_input(x, c):
+            c.add_(1)
+            return x * c
+
+        refused = [
+            (lambda x: torch.dropout(x, 0.5, True), (x,), "bernoulli_.float is random"),
+            (
+                lambda x: x[x > 0],
+                (x,),
+                "index.Tensor has a data-dependent output shape",
+            ),
+            (mutate_view, (x,), "add_.Tensor mutates a view or a viewed tensor"),
+            (mutate_input, (x, torch.randn(4, 3)), "add_.Tensor mutates an input"),
+            (
+                lambda x: x * c[:, :3],
+                (x,),
+                "slice.Tensor uses a tensor from outside the graph",
+            ),
+        ]
+        for fn, args, msg in refused:
+            with self.assertRaisesRegex(NotImplementedError, msg):
+                torch._rust._trace_joint(fn, *args)
+
+    def test_joint_partition(self):
+        # The min-cut partition saves what can't be recomputed (mm's output)
+        # and recomputes pointwise ops and views in the backward, from the
+        # inputs a node keeps anyway.
+        def mlp(x, w):
+            h = x @ w
+            return (h.sigmoid() * h).exp().sum()
+
+        x, w = (
+            torch.randn(8, 4, requires_grad=True),
+            torch.randn(4, 2, requires_grad=True),
+        )
+        self.assertExpectedInline(
+            torch._rust._trace_joint(mlp, x, w, partition=True),
+            """\
+forward:
+bb0(%0 s0, %1 s1):
+  %2 = Aten aten::mm %0, %1
+  %3 = Aten aten::sigmoid %2
+  %4 = Aten aten::mul.Tensor %3, %2
+  %5 = Aten aten::exp %4
+  %6 = Aten aten::sum %5
+  leave(%6, %0, %1, %2)
+backward:
+bb0(%0 s0, %1 s1, %2 s2, %3 s3):
+  %4 = Aten aten::sigmoid %2
+  %5 = Aten aten::detach %4
+  %6 = Aten aten::mul.Tensor %4, %2
+  %7 = Aten aten::exp %6
+  %8 = Aten aten::detach %7
+  %9 = Lit [8, 2]
+  %10 = Aten aten::expand %3, %9
+  %11 = Aten aten::detach %8
+  %12 = Aten aten::mul.Tensor %10, %11
+  %13 = Aten aten::mul.Tensor %12, %4
+  %14 = Aten aten::mul.Tensor %12, %2
+  %15 = Aten aten::detach %5
+  %16 = Aten aten::sigmoid_backward %14, %15
+  %17 = Aten aten::add.Tensor %13, %16
+  %18 = Aten aten::t %0
+  %19 = Aten aten::mm %18, %17
+  %20 = Aten aten::t %1
+  %21 = Aten aten::mm %17, %20
+  leave(%21, %19)
+""",
+        )
+
+    def test_autograd_bootstrap(self):
+        # A pure block of aten ops gets its own autograd node; its backward
+        # runs autograd on a traced copy of the block's run, recording the
+        # joint graph, and matches eager.
+        def f(a, b, c):
+            return (a * b + c) * a - b, a, a + c
+
+        x, y, z = torch.randn(3), torch.randn(3), torch.randn(3)
+        self.same(f, x, y, z)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+
+            def run(fn, rgs, use=(0, 2)):
+                args = [t.clone().requires_grad_(rg) for t, rg in zip((x, y, z), rgs)]
+                out = fn(f, *args)
+                self.assertIs(out[1], args[0])
+                sum(out[i].sum() for i in use).backward()
+                return out, [a.grad for a in args]
+
+            cfg = lambda fn, *a: torch._rust.call_with_cfg_execution(fn, *a)  # noqa: E731
+            eager = lambda fn, *a: fn(*a)  # noqa: E731
+            for rgs in [(True, True, True), (True, False, False), (False, True, True)]:
+                self.assertEqual(run(cfg, rgs), run(eager, rgs))
+            # An output that gets no gradient.
+            self.assertEqual(
+                run(cfg, (True, True, True), use=(0,)),
+                run(eager, (True, True, True), use=(0,)),
+            )
+            self.assertExpectedInline(
+                torch._rust._cfg_last_joint(),
+                """\
+bb0(%0 s0, %1 s1, %2 s2, %3 s3, %4 s4):
+  %5 = Aten aten::mul.Tensor %0, %1
+  %6 = Aten aten::add.Tensor %5, %2
+  %7 = Aten aten::mul.Tensor %6, %0
+  %8 = Aten aten::sub.Tensor %7, %1
+  %9 = Aten aten::add.Tensor %0, %2
+  %10 = Aten aten::neg %3
+  %11 = Aten aten::mul.Tensor %3, %6
+  %12 = Aten aten::mul.Tensor %3, %0
+  %13 = Aten aten::add.Tensor %4, %11
+  %14 = Aten aten::add.Tensor %4, %12
+  %15 = Aten aten::mul.Tensor %12, %0
+  %16 = Aten aten::mul.Tensor %12, %1
+  %17 = Aten aten::add.Tensor %13, %16
+  %18 = Aten aten::add.Tensor %10, %15
+  leave(%8, %9, %17, %18, %14)
+""",
+            )
+
+            def outputs():
+                a, b, c = (t.clone().requires_grad_() for t in (x, y, z))
+                return (a, b, c), torch._rust.call_with_cfg_execution(f, a, b, c)
+
+            (a, b, c), out = outputs()
+            self.assertEqual(out[0].grad_fn.name(), "CfgBackward")
+            with torch.no_grad():
+                b.add_(1)
+            with self.assertRaisesRegex(
+                RuntimeError, "modified by an inplace operation"
+            ):
+                out[0].sum().backward()
+
+            _, out = outputs()
+            out[0].sum().backward(retain_graph=True)
+            out[0].sum().backward()
+            with self.assertRaisesRegex(
+                RuntimeError, "backward through the graph a second time"
+            ):
+                out[0].sum().backward()
+
+            # Double backward differentiates through the real inputs.
+            def second(fn):
+                args = [t.clone().requires_grad_() for t in (x, y, z)]
+                out = fn(f, *args)
+                (g,) = torch.autograd.grad(
+                    (out[0] * out[0]).sum(), args[0], create_graph=True
+                )
+                return torch.autograd.grad(g.sum(), args[1])
+
+            self.assertEqual(second(cfg), second(eager))
+
+            with torch.no_grad():
+                self.assertFalse(outputs()[1][0].requires_grad)
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_training_version(self):
+        # The first backward splits the joint graph into a forward that saves
+        # what the backward needs and a backward, run by a version guarded on
+        # what the trace depended on; other runs take the eager-autograd path.
+        def f(a, b, n):
+            return (a * b + n) * a
+
+        x, y = torch.randn(3), torch.randn(3)
+        self.same(f, x, y, 2)
+        self.optimize_all(f)
+        cfg = lambda *args: torch._rust.call_with_cfg_execution(f, *args)  # noqa: E731
+
+        def grads(fn, a, b, n, create_graph=False):
+            a, b = a.clone().requires_grad_(), b.clone().requires_grad_()
+            out = fn(a, b, n)
+            if create_graph:
+                (g,) = torch.autograd.grad(out.sum(), a, create_graph=True)
+                return torch.autograd.grad(g.sum(), b)
+            out.sum().backward()
+            return out, a.grad, b.grad, out.grad_fn.name()
+
+        torch._rust._set_cfg_autograd(True)
+        try:
+            # A forward still pending when the first backward swaps in the
+            # training version keeps its own backward.
+            a1, b1, a2, b2 = (t.clone().requires_grad_() for t in (x, y, x, y))
+            o1, o2 = cfg(a1, b1, 2), cfg(a2, b2, 2)
+            o1.sum().backward()
+            o2.sum().backward()
+            self.assertEqual((a1.grad, b1.grad), (a2.grad, b2.grad))
+            self.assertExpectedInline(
+                torch._rust.cfg_observed(f, effects=False, types=False).split(
+                    "  origin:"
+                )[0],
+                """\
+bb0:
+  %0 = LoadLocal a
+  %1 = LoadLocal b
+  %2 = LoadLocal n
+  jump bb1(s0=%0, s1=%1, s2=%2)
+bb1(%3 s0, %4 s1, %5 s2):
+  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode, grad_enabled, requires_grad(s0), tensor(s0 f32 cpu [3] stride [1]), requires_grad(s1), tensor(s1 f32 cpu [3] stride [1]), value(s2 == 2)]:
+    %6 = Autograd t0 %3, %4, %5
+    %7 = Project 0 %6
+    outputs [%7]
+  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode]:
+    Resume
+    %8 = Aten aten::mul.Tensor %3, %4
+    %9 = Aten aten::add.Tensor %8, %5
+    %10 = Aten aten::mul.Tensor %9, %3
+    outputs [%10]
+  jump bb2(s0=o0)
+""",
+            )
+            self.assertExpectedInline(
+                torch._rust.cfg_observed(f, effects=False, types=False).split(
+                    "t0 forward:"
+                )[1],
+                """\
+
+    bb0(%0 s0, %1 s1):
+      %2 = Aten aten::mul.Tensor %0, %1
+      %3 = Lit 2
+      %4 = Aten aten::add.Tensor %2, %3
+      %5 = Aten aten::mul.Tensor %4, %0
+      leave(%5, %0, %1)
+t0 backward:
+    bb0(%0 s0, %1 s1, %2 s2):
+      %3 = Aten aten::mul.Tensor %0, %1
+      %4 = Lit 2
+      %5 = Aten aten::add.Tensor %3, %4
+      %6 = Aten aten::mul.Tensor %2, %5
+      %7 = Aten aten::mul.Tensor %2, %0
+      %8 = Aten aten::mul.Tensor %7, %0
+      %9 = Aten aten::mul.Tensor %7, %1
+      %10 = Aten aten::add.Tensor %6, %9
+      leave(%10, %8)
+""",
+            )
+            out, *rest = grads(cfg, x, y, 2)
+            self.assertEqual(rest[-1], "CfgBackward")
+            self.assertEqual((out, *rest[:-1]), grads(f, x, y, 2)[:-1])
+            self.assertEqual(
+                grads(cfg, x, y, 2, create_graph=True),
+                grads(f, x, y, 2, create_graph=True),
+            )
+            # Guard misses: another shape, dtype or scalar value.
+            for args in [
+                (torch.randn(4), torch.randn(4), 2),
+                (x.double(), y.double(), 2),
+                (x, y, 3),
+                (x, y, 2.0),
+            ]:
+                got, want = grads(cfg, *args), grads(f, *args)
+                self.assertEqual(got, want)
+
+            a, b = x.clone().requires_grad_(), y.clone().requires_grad_()
+            out = cfg(a, b, 2)
+            with torch.no_grad():
+                a.add_(1)
+            with self.assertRaisesRegex(
+                RuntimeError, "modified by an inplace operation"
+            ):
+                out.sum().backward()
+            out = cfg(x.clone().requires_grad_(), y.clone().requires_grad_(), 2)
+            out.sum().backward()
+            with self.assertRaisesRegex(
+                RuntimeError, "backward through the graph a second time"
+            ):
+                out.sum().backward()
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_untrainable(self):
+        # A block whose params a guard can't pin down (here a dict) gets no
+        # training version: it gives up at its first bootstrap and takes the
+        # eager-autograd path from the start.
+        def f(a, b, d):
+            return a * b, d
+
+        x, y, d = torch.randn(3), torch.randn(3), {}
+        self.same(f, x, y, d)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            names = []
+            for _ in range(3):
+                a, b = x.clone().requires_grad_(), y.clone().requires_grad_()
+                out, dd = torch._rust.call_with_cfg_execution(f, a, b, d)
+                self.assertIs(dd, d)
+                names.append(out.grad_fn.name())
+                out.sum().backward()
+                self.assertEqual((a.grad, b.grad), (y, x))
+            self.assertEqual(names, ["MulBackward0"] * 3)
+            self.assertEqual(
+                torch._rust._cfg_autograd_blocks(f),
+                [(1, 0, "gave up: param 2 is a dict, which a guard can't pin down")],
+            )
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_unsupported_state(self):
+        # Under forward AD, a functorch transform or saved_tensors_hooks, a
+        # block's bootstrap and its trained node would be wrong (they drop
+        # tangents, can't wrap functorch tensors, skip the hooks): both raise
+        # instead of quietly running eagerly. Outside them the block trains.
+        import torch.autograd.forward_ad as fwAD
+
+        ns = {"torch": torch, "fwAD": fwAD}
+        exec(
+            "def g(x):\n    return x * 2\n\n"
+            "def dual(x, t):\n    with fwAD.dual_level():\n        return fwAD.unpack_dual(g(fwAD.make_dual(x, t))).tangent\n\n"
+            "def transformed(x):\n    return torch.func.grad(lambda y: g(y).sum())(x)\n\n"
+            "def hooked(x):\n    with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):\n        return g(x)\n",
+            ns,
+        )
+        g, x, ones = ns["g"], torch.randn(3), torch.ones(3)
+        cases = [
+            (ns["dual"], (x, ones), "forward AD"),
+            (ns["transformed"], (x,), "a functorch transform"),
+            (ns["hooked"], (x,), "saved_tensors_hooks"),
+        ]
+        for fn, args, _ in cases:
+            self.same(fn, *args)
+        torch._rust._set_cfg_optimize(True)
+        for fn, _, _ in cases:
+            self.optimize_all(fn)
+        self.optimize_all(g)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            run = torch._rust.call_with_cfg_execution
+            # First g's bootstrap raises, then (once g has trained) its node.
+            for _ in range(2):
+                for fn, (x0, *rest), why in cases:
+                    msg = f"torch._rust can't compile autograd under {why} yet"
+                    a = x0.clone().requires_grad_()
+                    call = functools.partial(run, fn, a, *rest)
+                    # A call site's clone of g is optimized once its frame returns.
+                    with contextlib.suppress(NotImplementedError):
+                        call()
+                    with self.assertRaisesRegex(NotImplementedError, msg):
+                        call()
+                for _ in range(2):
+                    a = x.clone().requires_grad_()
+                    torch._rust.call_with_cfg_execution(g, a).sum().backward()
+                    self.assertEqual(a.grad, torch.full((3,), 2.0))
+                status = torch._rust._cfg_autograd_blocks(g)
+                self.assertEqual(status, [(1, 0, "trained")])
+        finally:
+            torch._rust._set_cfg_autograd(False)
+            torch._rust._set_cfg_optimize(False)
+
+    def test_autograd_sparse_param(self):
+        # A sparse CSC tensor has sizes but no strides (asking throws), so a
+        # block taking one gives up training instead of guarding on them, and
+        # its outputs get eager's autograd (our node would materialize the
+        # sparse output's missing gradient as zeros, which sparse can't do).
+        def f(a, b):
+            return a * 2, b * 3
+
+        x, y = torch.randn(3, 3).to_sparse_csc(), torch.randn(3)
+        self.same(f, x, y)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(2):
+                a, b = x.clone().requires_grad_(), y.clone().requires_grad_()
+                out, out_b = torch._rust.call_with_cfg_execution(f, a, b)
+                self.assertEqual(out.to_dense(), x.to_dense() * 2)
+                out_b.sum().backward()
+                self.assertEqual(b.grad, torch.full((3,), 3.0))
+            why = "gave up: tensor param 0 has no fixed shape and strides"
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, why)])
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_node_frees_tensors(self):
+        # Our node frees what it holds when it dies, not the next time pyo3
+        # attaches (any call into torch._rust would flush that).
+        def f(a, b):
+            return a * b
+
+        x = torch.randn(3)
+        self.same(f, x, x)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            # A bootstrapped run, a backward (which trains), a trained run.
+            for train in (False, True, False):
+                a, b = x.clone().requires_grad_(), x.clone()
+                refs = weakref.ref(a), weakref.ref(b)
+                out = torch._rust.call_with_cfg_execution(f, a, b)
+                if train:
+                    out.sum().backward()
+                del a, b, out
+                alive = [r() is not None for r in refs]
+                self.assertEqual(alive, [False, False])
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_null_param(self):
+        # A pure block can carry CPython's NULL through (here the self slot
+        # of calling an attribute that isn't a method, pushed before the
+        # args are computed), along with the callable: its guard checks the
+        # NULL, the callable is only passed on, and both are outputs of its
+        # training version.
+        class M:
+            pass
+
+        m = M()
+        m.o = lambda t: t.sum()
+
+        def f(m, a, b):
+            return m.o(a @ b * 2)
+
+        x, y = torch.randn(3, 3), torch.randn(3, 3)
+        self.same(f, m, x, y)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(3):
+                a, b = x.clone().requires_grad_(), y.clone().requires_grad_()
+                torch._rust.call_with_cfg_execution(f, m, a, b).backward()
+                ones = torch.ones(3, 3)
+                self.assertEqual((a.grad, b.grad), (2 * ones @ y.T, 2 * x.T @ ones))
+            self.assertEqual(
+                torch._rust._cfg_autograd_blocks(f),
+                [(1, 0, "trained")],
+            )
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_pinned_callee(self):
+        # A torch function read from a global through module attributes is
+        # pinned; rebinding the attribute misses the guard.
+        m = types.ModuleType("m")
+        m.act = torch.relu
+        ns = {"m": m}
+        exec("def f(x):\n    return m.act(x * 2)\n", ns)
+        f = ns["f"]
+        x = torch.tensor([-1.0, 2.0])
+        self.same(f, x)
+        self.optimize_all(f)
+        self.assertIn(
+            "version [guard: pinned(m.act), plain_tensor(s0), no_torch_function_mode]",
+            torch._rust.cfg_observed(f),
+        )
+        self.assertIn("Pinned m.act", torch._rust.cfg_observed(f))
+        self.assertEqual(
+            torch._rust.call_with_cfg_execution(f, x), torch.tensor([0.0, 4.0])
+        )
+        self.assertEqual(torch._rust._cfg_misses(f), [0, 0, 0])
+        m.act = torch.neg
+        self.assertEqual(
+            torch._rust.call_with_cfg_execution(f, x), torch.tensor([2.0, -4.0])
+        )
+        self.assertEqual(torch._rust._cfg_misses(f), [0, 1, 0])
+
+    def test_autograd_pinned_call(self):
+        # A pinned call that ran one torch op trains like an aten op, and its
+        # result counts as a plain tensor for the operators after it.
+        def f(x, w):
+            return torch.relu(x @ w) * 2
+
+        x, w = torch.randn(3, 3), torch.randn(3, 3)
+        self.same(f, x, w)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(3):
+                a, b = x.clone().requires_grad_(), w.clone().requires_grad_()
+                torch._rust.call_with_cfg_execution(f, a, b).sum().backward()
+                a2, b2 = x.clone().requires_grad_(), w.clone().requires_grad_()
+                f(a2, b2).sum().backward()
+                self.assertEqual((a.grad, b.grad), (a2.grad, b2.grad))
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            self.assertIn(
+                "pinned(torch.relu)",
+                torch._rust.cfg_observed(f).split("Autograd")[0].splitlines()[-2],
+            )
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_pinned_python_leaf(self):
+        # A Python function Dynamo puts in its graphs (F.relu) whose own frame
+        # ran only torch ops is pinned like a builtin, so the operators around
+        # its call land in the same trained block.
+        def f(x, w):
+            return F.relu(x @ w) * 2
+
+        x, w = torch.randn(3, 3), torch.randn(3, 3)
+        self.same(f, x, w)
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(3):
+                a, b = x.clone().requires_grad_(), w.clone().requires_grad_()
+                torch._rust.call_with_cfg_execution(f, a, b).sum().backward()
+                a2, b2 = x.clone().requires_grad_(), w.clone().requires_grad_()
+                f(a2, b2).sum().backward()
+                self.assertEqual((a.grad, b.grad), (a2.grad, b2.grad))
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            self.assertIn("pinned(F.relu)", torch._rust.cfg_observed(f))
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_int_tuple_param(self):
+        # A tuple of ints a training version bakes in is guarded by value.
+        def f(x, shape):
+            return torch.mul(torch.reshape(x, shape), 2)
+
+        x = torch.randn(2, 3)
+        self.same(f, x, (3, 2))
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for shape in [(3, 2), (3, 2), (3, 2), (6,), [3, 2]]:
+                a = x.clone().requires_grad_()
+                out = torch._rust.call_with_cfg_execution(f, a, shape)
+                self.assertEqual(out, x.reshape(shape) * 2)
+                out.sum().backward()
+                self.assertEqual(a.grad, torch.full((2, 3), 2.0))
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            self.assertIn("value(s1 == (3, 2))", torch._rust.cfg_observed(f))
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_traced_run_raises(self):
+        # When the bootstrap's traced run raises (here a shape mismatch; a
+        # TorchDispatchMode can also raise where eager wouldn't), the block
+        # gives up and runs as usual, raising as eager does.
+        def f(x, w):
+            return x @ w * 2
+
+        self.same(f, torch.randn(3, 3), torch.randn(3, 3))
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            a, b = torch.randn(3, 2, requires_grad=True), torch.randn(3, 3)
+            with self.assertRaisesRegex(RuntimeError, "cannot be multiplied"):
+                torch._rust.call_with_cfg_execution(f, a, b)
+            (status,) = torch._rust._cfg_autograd_blocks(f)
+            self.assertRegex(
+                status[2],
+                "^gave up: the traced run raised RuntimeError: .*cannot be multiplied",
+            )
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_autograd_rerun_repeats_no_mutation(self):
+        # A pure block can run again from its start (here the bootstrap's
+        # traced run raises and its origin reruns), so an in-place op is a
+        # barrier: it runs once.
+        def f(x, w):
+            x += 1
+            return x @ w * 2
+
+        torch._rust.call_with_cfg_execution(f, torch.randn(3, 3), torch.randn(3, 3))
+        self.optimize_all(f)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            x, w = torch.zeros(3, 2), torch.randn(3, 3, requires_grad=True)
+            with self.assertRaisesRegex(RuntimeError, "cannot be multiplied"):
+                torch._rust.call_with_cfg_execution(f, x, w)
+            self.assertEqual(x, torch.ones(3, 2))
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
     def test_promote_locals_barriers(self):
         # Stores stay pending across what Dynamo would capture (here
         # torch.relu and Tensor.neg) and reach the frame before anything else
@@ -1895,20 +2810,19 @@ bb0:
   %0 = LoadLocal x
   jump bb1(s0=%0)
 bb1(%1 s0):
-  version [guard: plain_tensor(s0), no_torch_function_mode]:
+  version [guard: pinned(torch.relu), plain_tensor(s0), no_torch_function_mode]:
     Resume
     %2 = Const 1
     %3 = Aten aten::add.Tensor %1, %2
-    %4 = LoadGlobal torch
-    %5 = LoadAttr relu %4
-    %6 = Call 1 null, %5, %3
-    %7 = LoadMethod neg %6
-    %8 = Project 0 %7
-    %9 = Project 1 %7
-    %10 = Call 0 %8, %9
-    outputs [%10]
-    unwind [3..6) -> bb3(s0=%3)
-    unwind [6..10) -> bb4(s0=%6)
+    %4 = Pinned torch.relu
+    %5 = Call 1 null, %4, %3
+    %6 = LoadMethod neg %5
+    %7 = Project 0 %6
+    %8 = Project 1 %6
+    %9 = Call 0 %7, %8
+    outputs [%9]
+    unwind [3..5) -> bb3(s0=%3)
+    unwind [5..9) -> bb4(s0=%5)
   jump bb2(s0=o0)
   origin:
     bb0(%0 s0):
@@ -1925,14 +2839,14 @@ bb1(%1 s0):
       leave(%9)
       unwind [3..6) -> outer 0(%2)
       unwind [6..10) -> outer 1(%5)
-bb2(%11 s0):
-  return %11
-bb3(%12 s0, %13 lasti, %14 exc):
-  StoreLocal y %12
-  reraise %14, lasti=%13
-bb4(%15 s0, %16 lasti, %17 exc):
-  StoreLocal y %15
-  reraise %17, lasti=%16
+bb2(%10 s0):
+  return %10
+bb3(%11 s0, %12 lasti, %13 exc):
+  StoreLocal y %11
+  reraise %13, lasti=%12
+bb4(%14 s0, %15 lasti, %16 exc):
+  StoreLocal y %14
+  reraise %16, lasti=%15
 """,
         )
 

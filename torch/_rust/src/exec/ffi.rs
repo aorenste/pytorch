@@ -15,6 +15,7 @@ pub type EvalFrameFn = unsafe extern "C" fn(*mut PyThreadState, *mut Frame, c_in
 extern "C" {
     // frame_shim.c
     pub fn tr_frame_code(f: *mut Frame) -> *mut PyObject;
+    pub fn tr_frame_qualname(f: *mut Frame) -> *mut PyObject;
     pub fn tr_frame_localsplus(f: *mut Frame) -> *mut *mut PyObject;
     pub fn tr_frame_func(f: *mut Frame) -> *mut PyObject;
     pub fn tr_frame_owned_by_generator(f: *mut Frame) -> c_int;
@@ -40,6 +41,7 @@ extern "C" {
     pub fn tr_unbound_local(f: *mut Frame, slot: c_int);
     pub fn tr_unbound_deref(f: *mut Frame, slot: c_int);
     pub fn tr_load_global(f: *mut Frame, namei: c_int, cache: *mut GlobalCache) -> *mut PyObject;
+    pub fn tr_resolve_pin(f: *mut Frame, global: c_int, attrs: *const u32, n: isize) -> *mut PyObject;
     pub fn tr_load_method(f: *mut Frame, namei: c_int, owner: *mut PyObject, out: *mut *mut PyObject) -> c_int;
     pub fn tr_bound_function(callable: *mut PyObject) -> *mut PyObject;
     pub fn tr_call(args: *const *mut PyObject, argc: c_int, kwnames: *mut PyObject) -> *mut PyObject;

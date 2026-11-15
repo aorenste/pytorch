@@ -60,11 +60,8 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
         if blk.origin.is_none() && blk.versions.last().is_none_or(|v| !v.guard.checks.is_empty()) {
             return Err(format!("bb{i}: nothing runs when every guard fails"));
         }
-        let checked = blk.versions.iter().flat_map(|v| &v.guard.checks).filter_map(|c| match c {
-            Check::PlainTensor(p) | Check::Exact(p, _) => Some(*p as usize),
-            Check::NoTorchFunctionMode => None,
-        });
-        if checked.into_iter().any(|p| p >= blk.params.len()) {
+        let mut checked = blk.versions.iter().flat_map(|v| &v.guard.checks).filter_map(|c| c.param());
+        if checked.any(|p| p as usize >= blk.params.len()) {
             return Err(format!("bb{i}: a guard checks a missing param"));
         }
         let n = blk.n_outputs();
@@ -185,6 +182,9 @@ fn check_project(cfg: &Cfg, ver: &Version, k: usize, i: u32, seen: &mut HashSet<
     }
     let n = match &cfg[p].op {
         Op::LoadMethod(_) | Op::IterNext | Op::Send => 2,
+        // As many as the overload returns, checked when it runs.
+        Op::Aten { .. } => usize::MAX,
+        Op::Autograd(t) => cfg.trainings.get(*t as usize).map_or(0, |t| t.outputs.len()),
         Op::Bytecode { opcode, arg } => opcodes::signature(*opcode, *arg, false).map_or(0, |s| {
             let all_new = s.outputs.iter().all(|o| *o == opcodes::Out::New);
             if all_new && s.outputs.len() > 1 { s.outputs.len() } else { 0 }

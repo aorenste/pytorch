@@ -8,5 +8,7 @@ namespace torch::rust {
 // matching disable on the same thread.
 void op_hook_enable();
 void op_hook_disable();
+// While enabled, stops (or restarts) running the hook.
+void op_hook_pause(bool paused);
 
 } // namespace torch::rust

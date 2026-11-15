@@ -27,12 +27,18 @@
 // of a replaced op (an aten op on plain tensors returns a plain tensor), since
 // nothing checks values in the middle of a version. Dtypes, devices and
 // shapes don't matter here: the same op runs whatever they are.
+//
+// Calls to torch functions stay calls (as in Dynamo's graphs; autograd's
+// tracer sees the aten ops below them), but a callee read from a global
+// through module attributes (`F.linear`, `torch.relu`) is pinned: the version
+// calls the object those loads produced when it was optimized, and its guard
+// checks the loads would still produce it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::ir::{
-    Block, BlockId, Builtin, Cfg, Check, Edge, Exit, Handler, Op, ParamKind, TermUnwind, Terminator, UnwindSegment,
-    ValueId, Version,
+    Block, BlockId, Builtin, Cfg, Check, Edge, Exit, Handler, NULL, Op, ParamKind, Pin, PinPath, TermUnwind, Terminator,
+    UnwindSegment, ValueId, Version,
 };
 use super::outline::{self, Outline};
 
@@ -43,25 +49,47 @@ pub struct AtenOp {
     pub args: Vec<Arg>,
 }
 
+// What the caller observed about a call whose callee may be pinned: the
+// callee's name, and the call's args after the callable if it always returned
+// a plain tensor (each None if it wasn't a plain tensor or builtin scalar).
+pub struct PinnedCall {
+    pub name: String,
+    pub args: Option<Vec<Option<Arg>>>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arg {
     PlainTensor,
     Scalar(Builtin),
 }
 
+// What the caller observed running the Cfg that the optimizer relies on.
+pub struct Observed {
+    // The instrs that may sit in a pure block.
+    pub movable: HashSet<ValueId>,
+    // The operators that may be replaced.
+    pub aten: HashMap<ValueId, AtenOp>,
+    // The calls whose callee may be pinned.
+    pub calls: HashMap<ValueId, PinnedCall>,
+    // The values only ever seen NULL.
+    pub nulls: HashSet<ValueId>,
+}
+
 // Optimizes `blocks` (each split, and its pure blocks outlined into
 // themselves), then renumbers the blocks. Returns each old block's new id.
-// `movable`: the instrs that may sit in a pure block; `aten`: the operators
-// that may be replaced. With `strict`, a block that can't be optimized is an
-// error; otherwise it's left as it is.
+// Each pin added to Cfg::pins gets the call it was made for pushed on
+// `pinned`. With `strict`, a block that can't be optimized is an error;
+// otherwise it's left as it is.
 pub fn optimize_blocks(
     cfg: &mut Cfg,
     blocks: &[BlockId],
-    movable: &HashSet<ValueId>,
-    aten: &HashMap<ValueId, AtenOp>,
+    obs: &Observed,
+    pinned: &mut Vec<ValueId>,
     strict: bool,
 ) -> Result<Vec<Option<BlockId>>, String> {
     let mut pure = vec![];
+    // Each pure block param, and the value it stands for (what was observed).
+    let mut stands_for = HashMap::new();
     for &b in blocks {
         if b.idx() >= cfg.blocks.len() {
             return Err(format!("no block bb{}", b.0));
@@ -75,55 +103,219 @@ pub fn optimize_blocks(
             }
             continue;
         }
-        pure.extend(split(cfg, b, movable));
+        pure.extend(split(cfg, b, &obs.movable, &mut stands_for));
     }
     let map = cfg.compact_blocks();
     for p in pure {
         let p = map[p.idx()].expect("a pure block is reachable");
         outline::outline(cfg, &[p], Outline::Merge);
-        use_aten(cfg, p, aten);
+        let is_null = |v: ValueId| v == NULL || obs.nulls.contains(stands_for.get(&v).unwrap_or(&v));
+        pin_calls(cfg, p, &obs.calls, &is_null, pinned);
+        use_aten(cfg, p, &obs.aten, &obs.calls);
     }
     Ok(map)
 }
 
+// A module's type has only dunder attributes, so any other name is read from
+// the module's __dict__ (and LoadMethod gives no method for it).
+fn plain_name(cfg: &Cfg, n: u32) -> bool {
+    !cfg.names.get(n as usize).is_some_and(|s| s.starts_with("__"))
+}
+
+// The global and module attributes `v` was read through in `body`, if it was.
+fn load_path(cfg: &Cfg, body: &HashSet<ValueId>, v: ValueId) -> Option<PinPath> {
+    if !body.contains(&v) {
+        return None;
+    }
+    match cfg[v].op {
+        Op::LoadGlobal(n) => Some(PinPath { global: n, attrs: vec![] }),
+        Op::LoadAttr(n) if plain_name(cfg, n) => {
+            let mut p = load_path(cfg, body, cfg[v].args[0])?;
+            p.attrs.push(n);
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+// Pins the callees of `calls` in pure block p's version (see the top of the
+// file), adding to its guard, and guards the params `is_null` says were
+// always NULL on being NULL. A callee loaded in the block is guarded on its
+// loads; one passed in as a param, on the param's identity.
+fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is_null: &dyn Fn(ValueId) -> bool, pinned: &mut Vec<ValueId>) {
+    let body = cfg[p].versions[0].body.clone();
+    let params = cfg[p].params.clone();
+    let in_body: HashSet<ValueId> = body.iter().copied().collect();
+    let mut checks: Vec<Check> = params.iter().enumerate().filter(|(_, q)| is_null(**q)).map(|(i, _)| Check::Null(i as u32)).collect();
+    // Loads only the pinned callees read, made Null if nothing else reads them.
+    let mut chain = vec![];
+    // Pinned values for callees passed in, to put at the start of the body.
+    let mut prologue = vec![];
+    for &v in &body {
+        let Some(call) = calls.get(&v) else {
+            continue;
+        };
+        if !matches!(cfg[v].op, Op::Call { .. }) || cfg[v].args.len() < 2 {
+            continue;
+        }
+        let (a0, a1) = (cfg[v].args[0], cfg[v].args[1]);
+        let param = |x: ValueId| params.iter().position(|q| *q == x);
+        enum Form {
+            // NULL, then the callee loaded in the block.
+            Loaded,
+            // A LoadMethod's projects, of a module loaded in the block.
+            Method(ValueId),
+            // NULL (maybe a param), then the callee as param i.
+            Param(usize),
+        }
+        let form = match (&cfg[a0].op, &cfg[a1].op) {
+            _ if is_null(a0) && param(a1).is_some() => Form::Param(param(a1).unwrap()),
+            _ if a0 == NULL => Form::Loaded,
+            (Op::Project(0), Op::Project(1)) if cfg[a0].args[0] == cfg[a1].args[0] => Form::Method(cfg[a1].args[0]),
+            _ => continue,
+        };
+        let path = match form {
+            Form::Loaded => load_path(cfg, &in_body, a1),
+            Form::Method(m) => match cfg[m].op {
+                Op::LoadMethod(n) if in_body.contains(&m) && plain_name(cfg, n) => load_path(cfg, &in_body, cfg[m].args[0]).map(|mut p| {
+                    p.attrs.push(n);
+                    p
+                }),
+                _ => None,
+            },
+            Form::Param(_) => None,
+        };
+        if path.is_none() && !matches!(form, Form::Param(_)) {
+            continue;
+        }
+        let name = match &path {
+            Some(path) => std::iter::once(path.global).chain(path.attrs.iter().copied()).map(|n| cfg.names[n as usize].as_str()).collect::<Vec<_>>().join("."),
+            None => call.name.clone(),
+        };
+        let pin = Pin { name, path };
+        let k = match cfg.pins.iter().position(|q| *q == pin && q.path.is_some()) {
+            Some(k) => k,
+            None => {
+                cfg.pins.push(pin);
+                pinned.push(v);
+                cfg.pins.len() - 1
+            }
+        } as u32;
+        let check = match form {
+            Form::Param(i) => Check::Is(i as u32, k),
+            _ => Check::Pinned(k),
+        };
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+        cfg[v].args[0] = NULL;
+        match form {
+            Form::Param(_) => {
+                let pv = cfg.add(Op::Pinned(k), vec![], cfg[v].origin);
+                prologue.push(pv);
+                cfg[v].args[1] = pv;
+            }
+            Form::Loaded | Form::Method(_) => {
+                // The loads the callee was read through, from the callee down.
+                let mut x = match form {
+                    Form::Method(m) => {
+                        chain.push(a0);
+                        Some(m)
+                    }
+                    _ => cfg[a1].args.first().copied(),
+                };
+                while let Some(l) = x {
+                    chain.push(l);
+                    x = cfg[l].args.first().copied();
+                }
+                cfg[a1].op = Op::Pinned(k);
+                cfg[a1].args.clear();
+            }
+        }
+    }
+    if checks.is_empty() {
+        return;
+    }
+    // Drop the loads (and a LoadMethod's NULL) nothing reads any more, each
+    // before the one it reads; the guard ensures they wouldn't have raised.
+    let ver = &cfg[p].versions[0];
+    let mut used: HashMap<ValueId, usize> = HashMap::new();
+    let handler_uses = ver.unwind.iter().flat_map(|s| handler_args(&s.handler));
+    for x in body.iter().flat_map(|v| cfg[*v].args.clone()).chain(ver.outputs.iter().copied()).chain(handler_uses) {
+        *used.entry(x).or_default() += 1;
+    }
+    let mut dead = HashSet::new();
+    for x in chain {
+        let unused = |x: &ValueId| used.get(x).copied().unwrap_or(0) == 0;
+        let removable = match cfg[x].op {
+            Op::LoadGlobal(_) | Op::LoadAttr(_) | Op::Project(_) => unused(&x),
+            // Its projects (the NULL and the pinned callee) are its outputs.
+            Op::LoadMethod(_) => body.iter().all(|y| dead.contains(y) || !(matches!(cfg[*y].op, Op::Project(_)) && cfg[*y].args[0] == x)),
+            _ => false,
+        };
+        if removable && dead.insert(x) {
+            for a in cfg[x].args.clone() {
+                *used.entry(a).or_default() -= 1;
+            }
+        }
+    }
+    let ver = &mut cfg[p].versions[0];
+    // Unwind segments start at body indices.
+    let new_index = |i: usize| prologue.len() + body[..i].iter().filter(|v| !dead.contains(*v)).count();
+    for (k, seg) in ver.unwind.iter_mut().enumerate() {
+        // The first segment keeps covering the prologue.
+        seg.from = if k == 0 && seg.from == 0 { 0 } else { new_index(seg.from) };
+    }
+    ver.body = prologue.into_iter().chain(body.iter().copied().filter(|v| !dead.contains(v))).collect();
+    ver.guard.checks.extend(checks);
+    // The loads could raise; a pinned callee can't.
+    cfg.normalize_unwind(p);
+}
+
 // Replaces the operators of pure block p's version with aten ops where the
-// guard can make that valid, and sets the guard.
-fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>) {
+// guard can make that valid, and adds to the guard. A pinned call returning a
+// plain tensor counts as a replaced op when its args are known as an
+// operator's must be.
+fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &HashMap<ValueId, PinnedCall>) {
     let params = cfg[p].params.clone();
     let body = cfg[p].versions[0].body.clone();
     let mut checks: BTreeSet<Check> = BTreeSet::new();
     // Results of replaced ops: plain tensors whenever the guard holds.
     let mut tensors: HashSet<ValueId> = HashSet::new();
     for v in body {
-        let Some(a) = aten.get(&v) else {
-            continue;
+        let pinned_call = matches!(cfg[v].op, Op::Call { .. }) && cfg[v].args.get(1).is_some_and(|c| matches!(cfg[*c].op, Op::Pinned(_)));
+        let (args, kinds): (Vec<ValueId>, Vec<Option<Arg>>) = match (aten.get(&v), calls.get(&v)) {
+            (Some(a), _) => (cfg[v].args.clone(), a.args.iter().copied().map(Some).collect()),
+            (_, Some(PinnedCall { args: Some(kinds), .. })) if pinned_call => (cfg[v].args[2..].to_vec(), kinds.clone()),
+            _ => continue,
         };
-        if cfg[v].args.len() != a.args.len() {
+        if args.len() != kinds.len() {
             continue;
         }
         let mut need = vec![];
-        let ok = cfg[v].args.iter().zip(&a.args).all(|(x, kind)| match params.iter().position(|q| q == x) {
-            Some(i) => {
+        let ok = args.iter().zip(&kinds).all(|(x, kind)| match (params.iter().position(|q| q == x), kind) {
+            (Some(i), Some(kind)) => {
                 need.push(match kind {
                     Arg::PlainTensor => Check::PlainTensor(i as u32),
                     Arg::Scalar(t) => Check::Exact(i as u32, *t),
                 });
                 true
             }
-            None => match kind {
-                Arg::PlainTensor => tensors.contains(x),
-                Arg::Scalar(_) => matches!(cfg[*x].op, Op::Const(_)),
-            },
+            (Some(_), None) => false,
+            (None, Some(Arg::PlainTensor)) => tensors.contains(x),
+            (None, _) => matches!(cfg[*x].op, Op::Const(_)),
         });
         if ok {
             checks.extend(need);
-            cfg[v].op = Op::Aten(a.name.clone());
+            if !pinned_call {
+                cfg[v].op = Op::Aten { name: aten[&v].name.clone(), kwnames: vec![] };
+            }
             tensors.insert(v);
         }
     }
     if !tensors.is_empty() {
         checks.insert(Check::NoTorchFunctionMode);
-        cfg[p].versions[0].guard.checks = checks.into_iter().collect();
+        cfg[p].versions[0].guard.checks.extend(checks);
     }
 }
 
@@ -196,7 +388,7 @@ fn map_handler(h: &Handler, f: impl Fn(ValueId) -> ValueId) -> Handler {
 // Splits block b (one version, no origin) into a chain of glue and pure
 // blocks; b stays the first glue block. Returns the pure blocks (new ids, not
 // yet renumbered), none if b has no stretch worth splitting out.
-fn split(cfg: &mut Cfg, b: BlockId, movable: &HashSet<ValueId>) -> Vec<BlockId> {
+fn split(cfg: &mut Cfg, b: BlockId, movable: &HashSet<ValueId>, stands_for: &mut HashMap<ValueId, ValueId>) -> Vec<BlockId> {
     let ver = cfg[b].versions[0].clone();
     let returns = matches!(cfg[b].term, Terminator::Jump(Exit::Return(_)));
     let handler_at = |i: usize| -> Handler {
@@ -344,6 +536,7 @@ fn split(cfg: &mut Cfg, b: BlockId, movable: &HashSet<ValueId>) -> Vec<BlockId> 
             for (j, v) in live_in[k].iter().enumerate() {
                 let p = cfg.add(Op::Param(ParamKind::Stack(j as u32)), vec![], term_origin);
                 local.insert(*v, p);
+                stands_for.insert(p, *stands_for.get(v).unwrap_or(v));
                 blk.params.push(p);
             }
         }

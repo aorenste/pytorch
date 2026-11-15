@@ -34,6 +34,28 @@ const Tensor* TORCH_RUST_NULLABLE tensor_by_type(std::uintptr_t py_obj) noexcept
 // Whether a __torch_function__ mode would intercept torch calls.
 bool torch_function_mode_active();
 
+bool grad_mode_enabled();
+// Sets grad mode; returns what it was.
+bool set_grad_mode(bool on);
+// The version counter in-place ops bump (Tensor._version).
+int64_t tensor_version(const Tensor& t);
+// Whether a forward-mode AD level is open (as custom autograd Functions check).
+bool forward_ad_active();
+// Whether saved_tensors_hooks would pack tensors saved for backward.
+bool saved_tensor_hooks_active();
+// Whether a functorch transform (grad, vmap, ...) is running.
+bool functorch_active();
+
+// Whether t is a plain strided tensor with exactly this dtype, device, sizes
+// and strides (c10's enums for dtype and device).
+bool tensor_matches(
+    const Tensor& t,
+    int8_t dtype,
+    int8_t device_type,
+    int8_t device_index,
+    ::rust::Slice<const int64_t> sizes,
+    ::rust::Slice<const int64_t> strides) noexcept;
+
 int64_t tensor_dim(const Tensor& t);
 int64_t tensor_numel(const Tensor& t);
 int64_t tensor_size_at(const Tensor& t, int64_t dim);

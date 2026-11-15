@@ -3,8 +3,11 @@
 // of CPython's bytecode loop. Anything it can't run faithfully fails hard with
 // an exception rather than falling back to CPython.
 
+pub mod autograd;
 pub mod effects;
 pub mod ffi;
+pub mod graph;
+pub mod joint;
 mod live;
 mod run;
 pub mod torch_ops;
@@ -14,13 +17,13 @@ pub mod types;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::cfg::ir::{Annotations, BlockId, Cfg, Op, Site, ValueId};
+use crate::cfg::ir::{Annotations, BlockId, Cfg, Check, Lit, Op, Site, TensorSpec, Training, ValueId};
 use crate::cfg::opcodes::{self, Out};
 use crate::cfg::outline::Outline;
 
@@ -31,6 +34,20 @@ static PREV_EVAL_FRAME: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ACTIVE: Cell<usize> = const { Cell::new(0) };
+}
+
+// Runs f with no executor active on this thread: frames it runs are left to
+// CPython, and no effects are recorded.
+pub(crate) fn outside_executor<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(usize, *mut effects::Recorder);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE.set(self.0);
+            effects::set_current(self.1);
+        }
+    }
+    let _restore = Restore(ACTIVE.replace(0), effects::set_current(std::ptr::null_mut()));
+    f()
 }
 
 const CO_GENERATOR: u32 = 0x20;
@@ -58,12 +75,31 @@ pub struct Prepared {
     pub origins: Vec<Option<Prepared>>,
     // What has been observed running the Cfg. Shared with the Prepared of an
     // optimized copy of it, whose values keep their ids.
-    pub effects: Arc<Mutex<effects::Table>>,
-    // By value: the join of every object seen there.
-    pub types: Arc<Mutex<Vec<Option<types::Ty>>>>,
-    pub callees: Arc<Mutex<effects::Callees>>,
-    // For each Op::Aten instr, the operator overload's C++ binding.
-    pub aten: HashMap<ValueId, Py<PyAny>>,
+    pub effects: Arc<ffi::GilCell<effects::Table>>,
+    // By value: the join of every object seen there. Observed once per
+    // value an instr makes, so not behind a lock.
+    pub types: Arc<ffi::GilCell<Vec<types::Slot>>>,
+    pub callees: Arc<ffi::GilCell<effects::Callees>>,
+    // For each Op::Aten instr, the operator overload's C++ binding and its
+    // kwnames (None for none).
+    pub aten: HashMap<ValueId, (Py<PyAny>, Option<Py<PyTuple>>)>,
+    // Cfg::literals as Python objects.
+    pub literals: Vec<Py<PyAny>>,
+    // By block: how many times no version's guard held (see _cfg_misses).
+    pub misses: Box<[AtomicU32]>,
+    // By block: whether it may get its own autograd node (see autograd.rs);
+    // cleared when it can't, with why.
+    pub autograd: Box<[AtomicBool]>,
+    pub autograd_why: Box<[ffi::GilCell<Option<String>>]>,
+    // Cfg::trainings, prepared.
+    pub trainings: Vec<Arc<autograd::TrainingPrep>>,
+    // Whether running it records (see run.rs's recording): until every block
+    // of the Cfg has been offered to the optimizer, which reads nothing
+    // recorded after that. Optimized versions never record, and origins always
+    // do, so guard misses are still seen.
+    pub record: bool,
+    // What each of Cfg::pins was pinned to.
+    pub pins: Vec<Py<PyAny>>,
 }
 
 impl Prepared {
@@ -109,10 +145,12 @@ impl Prepared {
         }
         let mut aten = HashMap::new();
         for v in cfg.blocks.iter().flat_map(|b| &b.versions).flat_map(|ver| &ver.body) {
-            if let Op::Aten(name) = &cfg[*v].op {
-                aten.insert(*v, resolve_aten(name)?);
+            if let Op::Aten { name, kwnames } = &cfg[*v].op {
+                let kw = Python::attach(|py| (!kwnames.is_empty()).then(|| PyTuple::new(py, kwnames).map(|t| t.unbind())).transpose())?;
+                aten.insert(*v, (resolve_aten(name)?, kw));
             }
         }
+        let literals = Python::attach(|py| cfg.literals.iter().map(|l| lit_object(py, l)).collect::<PyResult<Vec<_>>>())?;
         let live = live::compute(&cfg);
         let code = run::Code::build(&cfg, &live, &flags);
         let mut global_slot = vec![u32::MAX; n];
@@ -146,11 +184,25 @@ impl Prepared {
             .collect::<PyResult<_>>()?;
         let (effects, types, callees) = match prev {
             Some(p) => {
-                p.types.lock().unwrap().resize(n, None);
+                unsafe { &mut *p.types.get() }.resize(n, types::Slot::default());
                 (p.effects.clone(), p.types.clone(), p.callees.clone())
             }
-            None => (Arc::default(), Arc::new(Mutex::new(vec![None; n])), Arc::default()),
+            None => (
+                Arc::new(ffi::GilCell::new(effects::Table::default())),
+                Arc::new(ffi::GilCell::new(vec![types::Slot::default(); n])),
+                Arc::new(ffi::GilCell::new(effects::Callees::default())),
+            ),
         };
+        let cfg_blocks = cfg.blocks.len();
+        let autograd = (0..cfg_blocks).map(|b| AtomicBool::new(autograd::ineligible(&cfg, BlockId(b as u32)).is_none())).collect();
+        let trainings = cfg
+            .trainings
+            .iter()
+            .map(|t| match prev.and_then(|p| p.trainings.iter().find(|q| Arc::ptr_eq(&q.training, t))) {
+                Some(q) => Ok(q.clone()),
+                None => autograd::TrainingPrep::new(t.clone()).map(Arc::new),
+            })
+            .collect::<PyResult<_>>()?;
         Ok(Prepared {
             cfg,
             projects,
@@ -164,6 +216,14 @@ impl Prepared {
             types,
             callees,
             aten,
+            literals,
+            misses: (0..cfg_blocks).map(|_| AtomicU32::new(0)).collect(),
+            autograd,
+            autograd_why: (0..cfg_blocks).map(|_| ffi::GilCell::new(None)).collect(),
+            trainings,
+            record: true,
+            // The pins the previous Cfg already had (pins are only added).
+            pins: Python::attach(|py| prev.map_or(vec![], |p| p.pins.iter().map(|o| o.clone_ref(py)).collect())),
         })
     }
 
@@ -176,8 +236,24 @@ impl Prepared {
     }
 }
 
+pub(crate) fn lit_object(py: Python<'_>, l: &Lit) -> PyResult<Py<PyAny>> {
+    let torch = || py.import("torch");
+    Ok(match l {
+        Lit::None => py.None(),
+        Lit::Bool(b) => pyo3::types::PyBool::new(py, *b).to_owned().into_any().unbind(),
+        Lit::Int(i) => i.into_pyobject(py)?.into_any().unbind(),
+        Lit::Float(bits) => f64::from_bits(*bits).into_pyobject(py)?.into_any().unbind(),
+        Lit::Str(x) => x.into_pyobject(py)?.into_any().unbind(),
+        Lit::IntList(xs) => pyo3::types::PyList::new(py, xs)?.into_any().unbind(),
+        Lit::FloatList(xs) => pyo3::types::PyList::new(py, xs.iter().map(|b| f64::from_bits(*b)))?.into_any().unbind(),
+        Lit::BoolList(xs) => pyo3::types::PyList::new(py, xs)?.into_any().unbind(),
+        Lit::Dtype(x) | Lit::Layout(x) | Lit::MemoryFormat(x) => torch()?.getattr(x.as_str())?.unbind(),
+        Lit::Device(x) => torch()?.getattr("device")?.call1((x.as_str(),))?.unbind(),
+    })
+}
+
 // torch.ops.<ns>.<op>.<overload>._op for "ns::op.overload" (or "ns::op").
-fn resolve_aten(name: &str) -> PyResult<Py<PyAny>> {
+pub(crate) fn resolve_aten(name: &str) -> PyResult<Py<PyAny>> {
     let err = || pyo3::exceptions::PyValueError::new_err(format!("not an operator name: {name}"));
     let (ns, rest) = name.split_once("::").ok_or_else(err)?;
     let (op, overload) = rest.split_once('.').unwrap_or((rest, "default"));
@@ -216,7 +292,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    fn new(cfg: Cfg, prev: Option<&Plan>) -> PyResult<Self> {
+    fn new(cfg: Cfg, prev: Option<&Plan>, record: bool, pins: Vec<Py<PyAny>>) -> PyResult<Self> {
         let mut resume = HashMap::new();
         let bodies = cfg.block_ids().flat_map(|b| cfg[b].versions.iter().enumerate().map(move |(vi, ver)| (b, vi, ver)));
         for (b, vi, ver) in bodies {
@@ -237,10 +313,13 @@ impl Plan {
                 }
             }
         }
-        Ok(Plan {
-            resume,
-            prep: Prepared::new(Arc::new(cfg), prev.map(|p| &p.prep))?,
-        })
+        let mut prep = Prepared::new(Arc::new(cfg), prev.map(|p| &p.prep))?;
+        prep.record = record;
+        prep.pins.extend(pins);
+        if prep.pins.len() != prep.cfg.pins.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("CFG executor: a pin has no object"));
+        }
+        Ok(Plan { resume, prep })
     }
 }
 
@@ -265,7 +344,7 @@ impl Compiled {
         let info = crate::cfg::python::code_info(code)?;
         let outline = *OUTLINE.lock().unwrap();
         let cfg = crate::cfg::build(info, true, outline).map_err(crate::cfg::python::to_pyerr)?;
-        let mut plan = Box::new(Plan::new(cfg, None)?);
+        let mut plan = Box::new(Plan::new(cfg, None, true, vec![])?);
         Ok(Compiled {
             plan: AtomicPtr::new(&mut *plan),
             plans: Mutex::new(vec![plan]),
@@ -546,7 +625,14 @@ thread_local! {
 // Optimizes `block` of c's Cfg, or every block it can (others are left as
 // they are), and swaps in the result. Blocks are renumbered, so block-site
 // effects move with their blocks.
+// Runs outside the executor: the Python code it runs (see is_in_graph) would
+// otherwise be recorded as effects of whatever site is running (the call
+// whose callee just returned, for the optimization after a first run).
 fn optimize(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()> {
+    outside_executor(|| optimize_now(py, c, block))
+}
+
+fn optimize_now(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()> {
     struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -559,20 +645,178 @@ fn optimize(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()
         Some(b) => vec![b],
         None => plan.prep.cfg.block_ids().collect(),
     };
-    let (movable, aten) = observed_ops(py, &plan.prep, &blocks);
+    let (movable, aten, pinnable, nulls) = observed_ops(py, &plan.prep, &blocks);
     let mut cfg = (*plan.prep.cfg).clone();
-    let renumbered = crate::cfg::optimize::optimize_blocks(&mut cfg, &blocks, &movable, &aten, block.is_some())
+    let (mut objects, mut calls) = (HashMap::new(), HashMap::new());
+    for (v, (f, call)) in pinnable {
+        objects.insert(v, f);
+        calls.insert(v, call);
+    }
+    let obs = crate::cfg::optimize::Observed { movable, aten, calls, nulls };
+    let mut pinned = vec![];
+    let renumbered = crate::cfg::optimize::optimize_blocks(&mut cfg, &blocks, &obs, &mut pinned, block.is_some())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let pins = pinned.iter().map(|v| objects[v].clone_ref(py)).collect();
     crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
+    let record = block.is_some() && plan.prep.record;
+    swap_plan(c, plan, cfg, record, pins, |p| unsafe { &mut *p.effects.get() }.renumber_blocks(&renumbered))
+}
+
+// Makes `cfg`, a changed copy of `plan`'s, the Cfg new frames of c run.
+// `before` runs first, unless another thread replaced `plan` meanwhile.
+// `pins`: what the Cfg's pins beyond plan's resolve to.
+fn swap_plan(c: &Compiled, plan: &Plan, cfg: Cfg, record: bool, pins: Vec<Py<PyAny>>, before: impl FnOnce(&Prepared)) -> PyResult<()> {
     let mut plans = c.plans.lock().unwrap();
     if !std::ptr::eq(c.plan(), plan) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err("the CFG was optimized concurrently"));
     }
-    plan.prep.effects.lock().unwrap().renumber_blocks(&renumbered);
-    let mut new = Box::new(Plan::new(cfg, Some(plan))?);
+    before(&plan.prep);
+    let mut new = Box::new(Plan::new(cfg, Some(plan), record, pins)?);
     c.plan.store(&mut *new, Ordering::Release);
     plans.push(new);
     Ok(())
+}
+
+// Gives block b of code's Cfg a version running `t` (see autograd.rs), if
+// the Cfg is still the one whose Prepared is at `prep`.
+pub(crate) fn add_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, checks: Vec<Check>, t: Training) -> PyResult<()> {
+    let c = unsafe { lookup(code)? };
+    let plan = c.plan();
+    if &plan.prep as *const Prepared as usize != prep {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("the CFG changed since the block ran"));
+    }
+    let mut cfg = (*plan.prep.cfg).clone();
+    crate::cfg::partition::add_training_version(&mut cfg, b, checks, t)
+        .map_err(|e| pyo3::exceptions::PyNotImplementedError::new_err(format!("no training version for bb{}: {e}", b.0)))?;
+    crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
+    swap_plan(c, plan, cfg, plan.prep.record, vec![], |_| {})?;
+    // The blocks keep their ids: those that gave up stay given up.
+    let new = &c.plan().prep;
+    for (i, flag) in plan.prep.autograd.iter().enumerate() {
+        if !flag.load(Ordering::Relaxed) && new.autograd[i].swap(false, Ordering::Relaxed) {
+            unsafe { *new.autograd_why[i].get() = (*plan.prep.autograd_why[i].get()).clone() };
+        }
+    }
+    Ok(())
+}
+
+// Stops block b of code's Cfg from bootstrapping (it can't get a training
+// version), if the Cfg is still the one whose Prepared is at `prep`.
+pub(crate) fn no_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, why: String) {
+    if let Ok(c) = unsafe { lookup(code) } {
+        let plan = c.plan();
+        if &plan.prep as *const Prepared as usize == prep {
+            plan.prep.autograd[b.idx()].store(false, Ordering::Relaxed);
+            unsafe { *plan.prep.autograd_why[b.idx()].get() = Some(why) };
+        }
+    }
+}
+
+/// For coverage reports: what became of each pure block of the CFG the
+/// executor runs for `code` with autograd on, as (block, guard misses,
+/// status). The status is "trained" (it has a training version), "eligible"
+/// (it bootstraps when next run with grad needed), "gave up: why" (its
+/// backward couldn't be compiled) or "ineligible: why".
+#[pyfunction]
+pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>) -> PyResult<Vec<(u32, u32, String)>> {
+    let c = unsafe { lookup(code)? };
+    let prep = &c.plan().prep;
+    let cfg = &prep.cfg;
+    let mut out = vec![];
+    for (i, blk) in cfg.blocks.iter().enumerate() {
+        if blk.origin.is_none() {
+            continue;
+        }
+        let b = BlockId(i as u32);
+        let trained = blk.versions.iter().any(|v| v.body.iter().any(|x| matches!(cfg[*x].op, crate::cfg::ir::Op::Autograd(_))));
+        let status = if trained {
+            "trained".to_string()
+        } else if let Some(why) = autograd::ineligible(cfg, b) {
+            format!("ineligible: {why}")
+        } else if prep.autograd[i].load(Ordering::Relaxed) {
+            "eligible".to_string()
+        } else {
+            format!("gave up: {}", unsafe { &*prep.autograd_why[i].get() }.as_deref().unwrap_or("?"))
+        };
+        out.push((i as u32, prep.misses[i].load(Ordering::Relaxed), status));
+    }
+    Ok(out)
+}
+
+/// For testing guards: add checks to the first version of block `block` (which
+/// must have an origin to fall back to) of the CFG the executor runs for
+/// `code`. Each check is a tuple: ("grad_enabled", bool),
+/// ("requires_grad", param, bool), ("tensor", param, example tensor),
+/// ("value", param, None | bool | int | float), ("no_forward_ad",),
+/// ("no_saved_tensor_hooks",).
+#[pyfunction]
+pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<'_, PyTuple>>) -> PyResult<()> {
+    let c = unsafe { lookup(code)? };
+    let plan = c.plan();
+    let mut cfg = (*plan.prep.cfg).clone();
+    let b = BlockId(block);
+    if b.idx() >= cfg.blocks.len() || cfg[b].origin.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!("bb{block} has no origin")));
+    }
+    let bad = |c: &Bound<'_, PyTuple>| pyo3::exceptions::PyValueError::new_err(format!("bad check {c}"));
+    for t in &checks {
+        let kind: String = t.get_item(0)?.extract()?;
+        let param = || -> PyResult<u32> { t.get_item(1)?.extract() };
+        let check = match kind.as_str() {
+            "grad_enabled" => Check::GradEnabled(t.get_item(1)?.extract()?),
+            "requires_grad" => Check::RequiresGrad(param()?, t.get_item(2)?.extract()?),
+            "tensor" => {
+                let x = t.get_item(2)?;
+                let tensor: &crate::bindings::ffi::Tensor = x.extract()?;
+                let mut m = crate::bindings::ffi::TensorMeta::default();
+                crate::bindings::ffi::tensor_meta(tensor, &mut m);
+                if !m.strided {
+                    return Err(pyo3::exceptions::PyValueError::new_err("a tensor check needs a strided tensor"));
+                }
+                Check::TensorMeta(
+                    param()?,
+                    Box::new(TensorSpec {
+                        dtype: m.dtype,
+                        device_type: m.device_type,
+                        device_index: m.device_index,
+                        sizes: tensor.sizes().to_vec(),
+                        strides: tensor.strides().to_vec(),
+                    }),
+                )
+            }
+            "value" => Check::Value(param()?, lit(&t.get_item(2)?).ok_or_else(|| bad(t))?),
+            "no_forward_ad" => Check::NoForwardAD,
+            "no_saved_tensor_hooks" => Check::NoSavedTensorHooks,
+            _ => return Err(bad(t)),
+        };
+        cfg[b].versions[0].guard.checks.push(check);
+    }
+    crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
+    swap_plan(c, plan, cfg, plan.prep.record, vec![], |_| {})
+}
+
+// A scalar as a Lit (bool before int: bool is an int subclass).
+pub(crate) fn lit(o: &Bound<'_, PyAny>) -> Option<Lit> {
+    if o.is_none() {
+        Some(Lit::None)
+    } else if o.is_exact_instance_of::<pyo3::types::PyBool>() {
+        Some(Lit::Bool(o.is_truthy().ok()?))
+    } else if o.is_exact_instance_of::<pyo3::types::PyInt>() {
+        Some(Lit::Int(o.extract().ok()?))
+    } else if o.is_exact_instance_of::<pyo3::types::PyFloat>() {
+        Some(Lit::Float(o.extract::<f64>().ok()?.to_bits()))
+    } else {
+        None
+    }
+}
+
+/// How many times each block of the CFG the executor runs for `code` found
+/// no version whose guard held (and ran its origin), since the CFG last
+/// changed.
+#[pyfunction]
+pub fn _cfg_misses(code: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    let c = unsafe { lookup(code)? };
+    Ok(c.plan().prep.misses.iter().map(|m| m.load(Ordering::Relaxed)).collect())
 }
 
 // The instrs of `blocks` that, as observed, run no code that could look at
@@ -585,27 +829,42 @@ fn optimize(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()
 // the operators that may be replaced by the aten op they ran: every visit ran
 // that one op, the left operand was always a plain tensor (a reflected
 // operator's aten args don't follow the operand order) and each operand was
-// always a plain tensor or one builtin scalar type.
+// always a plain tensor or one builtin scalar type. And the movable calls
+// whose callee may be pinned, with it: every visit ran one torch op, the same
+// one (so a pinned call is like an aten op to autograd). And the values only
+// ever seen NULL.
+#[allow(clippy::type_complexity)]
 fn observed_ops(
     py: Python<'_>,
     prep: &Prepared,
     blocks: &[BlockId],
-) -> (HashSet<ValueId>, HashMap<ValueId, crate::cfg::optimize::AtenOp>) {
+) -> (
+    HashSet<ValueId>,
+    HashMap<ValueId, crate::cfg::optimize::AtenOp>,
+    HashMap<ValueId, (Py<PyAny>, crate::cfg::optimize::PinnedCall)>,
+    HashSet<ValueId>,
+) {
     use crate::cfg::ir::Builtin;
-    use crate::cfg::optimize::{Arg, AtenOp};
+    use crate::cfg::optimize::{Arg, AtenOp, PinnedCall};
     use types::{Kind, Ty};
     let mut aten = HashMap::new();
     let cfg = &prep.cfg;
     // Calls to judge with is_in_graph, which runs Python code (observed by the
     // executor, so not while holding the tables' locks).
-    let mut calls: Vec<(ValueId, Py<PyAny>)> = vec![];
+    // The last field: whether the call entered the callee's frame (and no
+    // other), so the callee must be a leaf (see leaf_ops).
+    let mut calls: Vec<(ValueId, Py<PyAny>, Option<Option<Vec<Option<Arg>>>>, bool)> = vec![];
     let mut out = HashSet::new();
+    let mut nulls = HashSet::new();
+    // Each instr and the torch ops it ran, checked by unrepeatable (which
+    // runs Python code).
+    let mut ran: Vec<(ValueId, Vec<String>)> = vec![];
     {
-        let types = prep.types.lock().unwrap();
-        let effects = prep.effects.lock().unwrap();
-        let callees = prep.callees.lock().unwrap();
-        let plain = |v: &ValueId, module_ok: bool| match types[v.idx()].as_ref() {
-            Some(Ty::Union(ks)) => ks.iter().all(|k| match k {
+        let types = unsafe { &*prep.types.get() };
+        let effects = unsafe { &*prep.effects.get() };
+        let callees = unsafe { &*prep.callees.get() };
+        let plain = |v: &ValueId, module_ok: bool| match types[v.idx()].ty.as_ref().and_then(Ty::kinds) {
+            Some(ks) => ks.iter().all(|k| match k {
                 Kind::None
                 | Kind::Bool(_)
                 | Kind::Int(_)
@@ -620,14 +879,42 @@ fn observed_ops(
             }),
             _ => false,
         };
-        let bodies = blocks.iter().filter(|b| b.idx() < cfg.blocks.len()).flat_map(|b| cfg[*b].versions.first());
+        let in_range = || blocks.iter().filter(|b| b.idx() < cfg.blocks.len());
+        for v in in_range().flat_map(|b| cfg[*b].params.iter().chain(cfg[*b].versions.iter().flat_map(|ver| &ver.body))) {
+            if matches!(types[v.idx()].ty.as_ref().and_then(Ty::kinds), Some([Kind::Null])) {
+                nulls.insert(*v);
+            }
+        }
+        let bodies = in_range().flat_map(|b| cfg[*b].versions.first());
         for v in bodies.flat_map(|ver| &ver.body) {
             let ins = &cfg[*v];
+            let ops: Vec<String> = effects
+                .get(Site::Instr(*v))
+                .iter()
+                .flat_map(|(seq, _)| seq.iter())
+                .filter_map(|e| match e {
+                    effects::Effect::TorchOp { op, .. } => Some(op.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !ops.is_empty() {
+                ran.push((*v, ops));
+            }
+            let arg = |a: &ValueId| match types[a.idx()].ty.as_ref().and_then(Ty::kinds) {
+                Some(ks) => match ks {
+                    [Kind::Tensor(t)] if plain_tensor_types().iter().any(|p| t.class().is(*p as *const _)) => {
+                        Some(Arg::PlainTensor)
+                    }
+                    [Kind::Int(_)] => Some(Arg::Scalar(Builtin::Int)),
+                    [Kind::Float] => Some(Arg::Scalar(Builtin::Float)),
+                    [Kind::Bool(_)] => Some(Arg::Scalar(Builtin::Bool)),
+                    _ => None,
+                },
+                _ => None,
+            };
             let no_frames = || {
-                effects
-                    .get(Site::Instr(*v))
-                    .iter()
-                    .all(|(seq, _)| !seq.iter().any(|e| matches!(e, effects::Effect::Frame { .. })))
+                let site = Site::Instr(*v);
+                !effects.varies(site) && effects.get(site).iter().all(|(seq, _)| !seq.iter().any(|e| matches!(e, effects::Effect::Frame { .. })))
             };
             let ok = match &ins.op {
                 Op::LoadLocal { .. }
@@ -638,8 +925,26 @@ fn observed_ops(
                 | Op::EvalBreaker
                 | Op::LoadGlobal(_) => true,
                 _ if callees.contains_key(v) => {
-                    if let (Some(f), true) = (callees[v].get(py), no_frames()) {
-                        calls.push((*v, f.unbind()));
+                    let site = Site::Instr(*v);
+                    let seqs = effects.get(site);
+                    // Every visit entered the callee's frame and nothing else
+                    // (what ran inside it is recorded in the callee's own Cfg).
+                    let direct = !effects.varies(site)
+                        && !seqs.is_empty()
+                        && seqs.iter().all(|(seq, _)| matches!(seq.as_slice(), [effects::Effect::Frame { how: effects::How::Direct, .. }]));
+                    let tensor_out = arg(v) == Some(Arg::PlainTensor);
+                    let args = || tensor_out.then(|| ins.args.iter().skip(2).map(arg).collect());
+                    if let (Some(f), true) = (callees[v].get(py), direct) {
+                        calls.push((*v, f.unbind(), Some(args()), true));
+                    } else if let (Some(f), true) = (callees[v].get(py), no_frames()) {
+                        let seqs = effects.get(Site::Instr(*v));
+                        let op = |seq: &[effects::Effect]| match seq {
+                            [effects::Effect::TorchOp { op, .. }] => Some(op.clone()),
+                            _ => None,
+                        };
+                        let first = seqs.first().and_then(|(seq, _)| op(seq));
+                        let one_op = first.is_some() && seqs.iter().all(|(seq, _)| op(seq) == first);
+                        calls.push((*v, f.unbind(), one_op.then_some(args()), false));
                     }
                     false
                 }
@@ -662,19 +967,7 @@ fn observed_ops(
                         ..
                     }
             );
-            let arg = |a: &ValueId| match types[a.idx()].as_ref() {
-                Some(Ty::Union(ks)) => match ks.as_slice() {
-                    [Kind::Tensor(t)] if plain_tensor_types().iter().any(|p| t.class().is(*p as *const _)) => {
-                        Some(Arg::PlainTensor)
-                    }
-                    [Kind::Int(_)] => Some(Arg::Scalar(Builtin::Int)),
-                    [Kind::Float] => Some(Arg::Scalar(Builtin::Float)),
-                    [Kind::Bool(_)] => Some(Arg::Scalar(Builtin::Bool)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let (true, [(seq, _)]) = (replaceable, effects.get(Site::Instr(*v))) {
+            if let (true, false, [(seq, _)]) = (replaceable, effects.varies(Site::Instr(*v)), effects.get(Site::Instr(*v))) {
                 if let [effects::Effect::TorchOp { op, .. }] = seq.as_slice() {
                     let args: Option<Vec<Arg>> = ins.args.iter().map(arg).collect();
                     if let Some(args) = args.filter(|a| a.first() == Some(&Arg::PlainTensor)) {
@@ -685,12 +978,75 @@ fn observed_ops(
         }
     }
     let mut in_graph: HashMap<*mut pyo3::ffi::PyObject, bool> = HashMap::new();
-    for (v, f) in calls {
+    let mut pinnable = HashMap::new();
+    for (v, f, pin, entered) in calls {
+        if entered && !leaf_ops(f.bind(py)).is_some_and(|ops| !ops.iter().any(|op| unrepeatable(py, op))) {
+            continue;
+        }
         if *in_graph.entry(f.as_ptr()).or_insert_with(|| is_in_graph(f.bind(py))) {
             out.insert(v);
+            if let Some(args) = pin {
+                let attr = |n: &str| f.bind(py).getattr(n).and_then(|a| a.extract::<String>()).ok();
+                let name = match (attr("__module__"), attr("__qualname__")) {
+                    (Some(m), Some(q)) => format!("{m}.{q}"),
+                    (_, q) => q.unwrap_or_else(|| "?".into()),
+                };
+                pinnable.insert(v, (f, PinnedCall { name, args }));
+            }
         }
     }
-    (out, aten)
+    // A pure block may run again from its start (its origin reruns after a
+    // raise), so nothing in it may have an effect a second run would repeat.
+    for (v, ops) in ran {
+        if ops.iter().any(|op| unrepeatable(py, op)) {
+            out.remove(&v);
+            aten.remove(&v);
+            pinnable.remove(&v);
+        }
+    }
+    (out, aten, pinnable, nulls)
+}
+
+// The torch ops a call of Python function `f` was seen to run, if every one
+// ran in f's own frame, which entered no other Python frame: then f is a leaf,
+// which Dynamo's in-graph functions (`F.relu`, `F.layer_norm`) usually are, and
+// a call of it can be treated like a call of a builtin.
+fn leaf_ops(f: &Bound<'_, PyAny>) -> Option<Vec<String>> {
+    let code = f.getattr("__code__").ok()?;
+    let c = unsafe { lookup(&code) }.ok()?;
+    let effects = unsafe { &*c.plans.lock().unwrap()[0].prep.effects.get() };
+    let mut ops = vec![];
+    for (seqs, varies) in effects.sites() {
+        if varies {
+            return None;
+        }
+        for e in seqs.iter().flat_map(|(seq, _)| seq) {
+            match e {
+                effects::Effect::TorchOp { op, .. } => ops.push(op.clone()),
+                effects::Effect::Frame { .. } => return None,
+            }
+        }
+    }
+    Some(ops)
+}
+
+// Whether running the op again would be seen: it mutates an argument, or
+// draws random numbers. Unknown ops count as unrepeatable.
+fn unrepeatable(py: Python<'_>, op: &str) -> bool {
+    static CACHE: std::sync::Mutex<Option<HashMap<String, bool>>> = std::sync::Mutex::new(None);
+    if let Some(r) = CACHE.lock().unwrap().get_or_insert_with(HashMap::new).get(op) {
+        return *r;
+    }
+    let r = (|| -> PyResult<bool> {
+        let (ns, rest) = op.split_once("::").unwrap_or(("aten", op));
+        let (name, overload) = rest.split_once('.').unwrap_or((rest, "default"));
+        let f = py.import("torch")?.getattr("ops")?.getattr(ns)?.getattr(name)?.getattr(overload)?;
+        let seeded = py.import("torch")?.getattr("Tag")?.getattr("nondeterministic_seeded")?;
+        Ok(f.getattr("_schema")?.getattr("is_mutable")?.is_truthy()? || f.getattr("tags")?.contains(seeded)?)
+    })()
+    .unwrap_or(true);
+    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(op.to_string(), r);
+    r
 }
 
 // Whether Dynamo puts calls to `f` in its graphs.
@@ -736,9 +1092,10 @@ impl Annotations for Observed<'_> {
         let prep = self.by_cfg[&(cfg as *const Cfg)];
         let mut lines = vec![];
         if let Site::Instr(v) = site {
-            // Describing runs Python code, so not under the lock.
+            // Describing runs Python code, which may record, so not holding
+            // the table.
             let py = unsafe { Python::assume_attached() };
-            let callee = prep.callees.lock().unwrap().get(&v).map(|c| match c {
+            let callee = unsafe { &*prep.callees.get() }.get(&v).map(|c| match c {
                 effects::Callee::One { ptr, weak, obj } => effects::Callee::One {
                     ptr: *ptr,
                     weak: *weak,
@@ -750,11 +1107,14 @@ impl Annotations for Observed<'_> {
                 lines.push(format!("callee {}", c.describe(py)));
             }
         }
-        let table = prep.effects.lock().unwrap();
+        let table = unsafe { &*prep.effects.get() };
         for (seq, n) in table.get(site) {
             let s = if *n == 1 { "" } else { "s" };
             lines.push(format!("effects [{n} visit{s}]:"));
             lines.extend(seq.iter().map(|e| format!("  {e}")));
+        }
+        if table.varies(site) {
+            lines.push("effects vary (more sequences than kept)".into());
         }
         lines
     }
@@ -763,8 +1123,8 @@ impl Annotations for Observed<'_> {
         if !self.types {
             return None;
         }
-        let table = self.by_cfg[&(cfg as *const Cfg)].types.lock().unwrap();
-        table[v.idx()].as_ref().map(|t| t.to_string())
+        let table = unsafe { &*self.by_cfg[&(cfg as *const Cfg)].types.get() };
+        table[v.idx()].ty.as_ref().map(|t| t.to_string())
     }
 }
 

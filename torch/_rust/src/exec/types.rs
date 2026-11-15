@@ -60,10 +60,9 @@ pub enum Konst<T> {
 }
 
 impl<T: PartialEq> Konst<T> {
-    fn join(self, o: Konst<T>) -> Self {
-        match (self, o) {
-            (Konst::Is(a), Konst::Is(b)) if a == b => Konst::Is(a),
-            _ => Konst::Varies,
+    fn absorb(&mut self, v: T) {
+        if matches!(self, Konst::Is(a) if *a != v) {
+            *self = Konst::Varies;
         }
     }
 }
@@ -73,6 +72,8 @@ impl<T: PartialEq> Konst<T> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Class {
     ptr: usize,
+    // tp_name, which for a heap type points into its name str.
+    name_ptr: usize,
     name: String,
 }
 
@@ -80,11 +81,31 @@ impl Class {
     unsafe fn of(obj: *mut PyObject) -> Self {
         let tp = ffi::Py_TYPE(obj);
         let name = std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned();
-        Class { ptr: tp as usize, name }
+        Class { ptr: tp as usize, name_ptr: (*tp).tp_name as usize, name }
     }
 
     pub fn is(&self, tp: *const ffi::PyTypeObject) -> bool {
         self.ptr == tp as usize
+    }
+
+    // Whether obj's class is this one.
+    unsafe fn of_obj(&self, obj: *mut PyObject) -> bool {
+        let tp = ffi::Py_TYPE(obj);
+        if self.ptr != tp as usize {
+            return false;
+        }
+        if (*tp).tp_name as usize == self.name_ptr {
+            return true;
+        }
+        // Byte by byte up to the NUL: names are short, and this is per object.
+        let mut p = (*tp).tp_name as *const u8;
+        for &b in self.name.as_bytes() {
+            if *p != b {
+                return std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy() == self.name;
+            }
+            p = p.add(1);
+        }
+        *p == 0 || std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy() == self.name
     }
 }
 
@@ -111,21 +132,28 @@ impl TensorTy {
         &self.class
     }
 
-    fn join(self, o: TensorTy) -> Self {
-        let shape = match (self.shape, o.shape) {
-            (Shape::Dims(a), Shape::Dims(b)) if a.len() == b.len() => {
-                Shape::Dims(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
+    unsafe fn absorb(&mut self, t: &crate::bindings::ffi::Tensor) {
+        let mut m = TensorMeta::default();
+        tensor_meta(t, &mut m);
+        if !m.defined {
+            (self.dtype, self.device, self.requires_grad, self.shape) = (Konst::Varies, Konst::Varies, Konst::Varies, Shape::Unknown);
+            return;
+        }
+        self.dtype.absorb(m.dtype);
+        if m.has_device {
+            self.device.absorb((m.device_type, m.device_index));
+        } else {
+            self.device = Konst::Varies;
+        }
+        self.requires_grad.absorb(m.requires_grad);
+        match &mut self.shape {
+            Shape::Dims(d) if m.has_shape && d.len() == m.sizes.len() => {
+                d.iter_mut().zip(&m.sizes).for_each(|(i, s)| *i = i.join(Interval::exact(*s)));
             }
-            _ => Shape::Unknown,
-        };
-        TensorTy {
-            class: self.class,
-            dtype: self.dtype.join(o.dtype),
-            device: self.device.join(o.device),
-            requires_grad: self.requires_grad.join(o.requires_grad),
-            shape,
+            _ => self.shape = Shape::Unknown,
         }
     }
+
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -152,35 +180,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    // Whether `self` and `o` join into one alternative of a union.
-    fn same(&self, o: &Kind) -> bool {
-        match (self, o) {
-            (Kind::Tensor(a), Kind::Tensor(b)) => a.class == b.class,
-            (Kind::Object(a), Kind::Object(b)) => a == b,
-            (Kind::Tuple(_) | Kind::VarTuple(_), Kind::Tuple(_) | Kind::VarTuple(_)) => true,
-            _ => std::mem::discriminant(self) == std::mem::discriminant(o),
-        }
-    }
-
-    // Only for kinds that are the same().
-    fn join(self, o: Kind) -> Kind {
-        match (self, o) {
-            (Kind::Bool(a), Kind::Bool(b)) => Kind::Bool(a.join(b)),
-            (Kind::Int(a), Kind::Int(b)) => Kind::Int(a.join(b)),
-            (Kind::Str(a), Kind::Str(b)) => Kind::Str(a.join(b)),
-            (Kind::Tensor(a), Kind::Tensor(b)) => Kind::Tensor(a.join(b)),
-            (Kind::Tuple(a), Kind::Tuple(b)) if a.len() == b.len() => {
-                Kind::Tuple(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
-            }
-            (a @ (Kind::Tuple(_) | Kind::VarTuple(_)), b) => Kind::VarTuple(a.tuple_len().join(b.tuple_len())),
-            (Kind::List(a), Kind::List(b)) => Kind::List(a.join(b)),
-            (Kind::Set(a), Kind::Set(b)) => Kind::Set(a.join(b)),
-            (Kind::FrozenSet(a), Kind::FrozenSet(b)) => Kind::FrozenSet(a.join(b)),
-            (Kind::Dict(a), Kind::Dict(b)) => Kind::Dict(a.join(b)),
-            (a, _) => a,
-        }
-    }
-
     fn tuple_len(&self) -> Interval {
         match self {
             Kind::Tuple(elems) => Interval::exact(elems.len() as i64),
@@ -192,36 +191,193 @@ impl Kind {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Ty {
-    // One to MAX_UNION alternatives, no two the same().
+    // One alternative, inline: what most values have.
+    One(Kind),
+    // Two to MAX_UNION alternatives, no object absorbed by two.
     Union(Vec<Kind>),
     Any,
 }
 
-impl Ty {
-    pub fn join(self, o: Ty) -> Ty {
-        let (Ty::Union(mut alts), Ty::Union(more)) = (self, o) else {
-            return Ty::Any;
-        };
-        for k in more {
-            match alts.iter().position(|a| a.same(&k)) {
-                Some(i) => {
-                    let a = std::mem::replace(&mut alts[i], Kind::Null);
-                    alts[i] = a.join(k);
-                }
-                None => alts.push(k),
-            }
+impl Kind {
+    // Joins obj in if it's of this kind (for tensors and objects, this
+    // class; tuples of any length); otherwise false.
+    unsafe fn absorb(&mut self, obj: *mut PyObject, in_tuple: bool) -> bool {
+        if obj.is_null() || matches!(self, Kind::Null) {
+            return obj.is_null() && matches!(self, Kind::Null);
         }
+        match self {
+            Kind::Null => unreachable!(),
+            Kind::None => obj == ffi::Py_None(),
+            Kind::Bool(k) => {
+                let is = ffi::PyBool_Check(obj) != 0;
+                if is {
+                    k.absorb(obj == ffi::Py_True());
+                }
+                is
+            }
+            Kind::Int(i) => {
+                let is = ffi::PyLong_CheckExact(obj) != 0;
+                if is {
+                    *i = i.join(int_interval(obj));
+                }
+                is
+            }
+            Kind::Float => ffi::PyFloat_CheckExact(obj) != 0,
+            Kind::Str(k) => {
+                let is = ffi::PyUnicode_CheckExact(obj) != 0;
+                if is && matches!(k, Konst::Is(s) if !str_equals(obj, s)) {
+                    *k = Konst::Varies;
+                }
+                is
+            }
+            Kind::Tensor(t) => match tensor_by_type(obj as usize).as_ref() {
+                Some(tt) if t.class.of_obj(obj) => {
+                    t.absorb(tt);
+                    true
+                }
+                _ => false,
+            },
+            Kind::Tuple(_) | Kind::VarTuple(_) => {
+                if ffi::PyTuple_CheckExact(obj) == 0 {
+                    return false;
+                }
+                let n = ffi::PyTuple_GET_SIZE(obj);
+                match self {
+                    Kind::Tuple(elems) if !in_tuple && n as usize <= MAX_TUPLE && n as usize == elems.len() => {
+                        for (i, e) in elems.iter_mut().enumerate() {
+                            e.absorb_in(ffi::PyTuple_GET_ITEM(obj, i as isize), true);
+                        }
+                    }
+                    _ => *self = Kind::VarTuple(self.tuple_len().join(Interval::exact(n as i64))),
+                }
+                true
+            }
+            Kind::List(i) => absorb_len(i, ffi::PyList_CheckExact(obj) != 0, || ffi::PyList_GET_SIZE(obj)),
+            Kind::Set(i) => absorb_len(i, ffi::PySet_CheckExact(obj) != 0, || ffi::PySet_Size(obj)),
+            Kind::FrozenSet(i) => absorb_len(i, ffi::PyFrozenSet_CheckExact(obj) != 0, || ffi::PySet_Size(obj)),
+            Kind::Dict(i) => absorb_len(i, ffi::PyDict_CheckExact(obj) != 0, || ffi::PyDict_Size(obj)),
+            // Builtins and tensors never get Object, so the class decides.
+            Kind::Object(c) => c.of_obj(obj),
+        }
+    }
+}
+
+fn absorb_len(i: &mut Interval, is: bool, len: impl FnOnce() -> isize) -> bool {
+    if is {
+        *i = i.join(Interval::exact(len() as i64));
+    }
+    is
+}
+
+impl Ty {
+    // Joins obj's Ty in, allocating only when obj is of a kind not seen here
+    // before.
+    pub unsafe fn absorb(&mut self, obj: *mut PyObject) {
+        self.absorb_in(obj, false)
+    }
+
+    // The alternatives, or None for Any.
+    pub fn kinds(&self) -> Option<&[Kind]> {
+        match self {
+            Ty::One(k) => Some(std::slice::from_ref(k)),
+            Ty::Union(alts) => Some(alts),
+            Ty::Any => None,
+        }
+    }
+
+    unsafe fn absorb_in(&mut self, obj: *mut PyObject, in_tuple: bool) {
+        let alts = match self {
+            Ty::Any => return,
+            Ty::One(k) => {
+                if !k.absorb(obj, in_tuple) {
+                    let Ty::One(k) = std::mem::replace(self, Ty::Any) else { unreachable!() };
+                    *self = Ty::Union(vec![k, kind(obj, in_tuple)]);
+                }
+                return;
+            }
+            Ty::Union(alts) => alts,
+        };
+        if alts.iter_mut().any(|a| a.absorb(obj, in_tuple)) {
+            return;
+        }
+        alts.push(kind(obj, in_tuple));
         if alts.len() > MAX_UNION {
-            Ty::Any
+            *self = Ty::Any;
+        }
+    }
+
+}
+
+// A value's Ty so far, and objects that wouldn't change it: of class
+// skip.0 with tp_name skip.1 (as Class::of_obj takes them to be the same), or
+// any with SKIP_ALL. Checked before observing, which most observations then
+// don't need.
+#[derive(Clone, Default)]
+pub struct Slot {
+    pub ty: Option<Ty>,
+    skip: (usize, usize),
+}
+
+const SKIP_ALL: usize = usize::MAX;
+
+impl Slot {
+    #[inline]
+    pub unsafe fn skips(&self, obj: *mut PyObject) -> bool {
+        if self.skip.0 == SKIP_ALL {
+            return true;
+        }
+        if obj.is_null() {
+            return false;
+        }
+        let tp = ffi::Py_TYPE(obj);
+        tp as usize == self.skip.0 && (*tp).tp_name as usize == self.skip.1
+    }
+
+    // `constant`: the value is always this object, and it's immutable.
+    pub unsafe fn observe(&mut self, obj: *mut PyObject, constant: bool) {
+        let ty = match &mut self.ty {
+            Some(t) => {
+                t.absorb(obj);
+                t
+            }
+            None => self.ty.insert(observe(obj)),
+        };
+        self.skip = if constant { (SKIP_ALL, 0) } else { ty.skip_key(obj) };
+    }
+}
+
+impl Ty {
+    // What Slot::skip can be after obj was absorbed: obj's class, if no
+    // object of it would change the alternative obj went into.
+    unsafe fn skip_key(&self, obj: *mut PyObject) -> (usize, usize) {
+        let Some(kinds) = self.kinds() else {
+            return (SKIP_ALL, 0);
+        };
+        if obj.is_null() {
+            return (0, 0);
+        }
+        let tp = ffi::Py_TYPE(obj);
+        let full = Interval { lo: i64::MIN, hi: i64::MAX };
+        let saturated = kinds.iter().any(|k| match k {
+            Kind::None => obj == ffi::Py_None(),
+            Kind::Float => ffi::PyFloat_CheckExact(obj) != 0,
+            Kind::Bool(Konst::Varies) => ffi::PyBool_Check(obj) != 0,
+            Kind::Str(Konst::Varies) => ffi::PyUnicode_CheckExact(obj) != 0,
+            Kind::Int(i) => *i == full && ffi::PyLong_CheckExact(obj) != 0,
+            Kind::Object(c) => c.ptr == tp as usize && c.name_ptr == (*tp).tp_name as usize,
+            _ => false,
+        });
+        if saturated {
+            (tp as usize, (*tp).tp_name as usize)
         } else {
-            Ty::Union(alts)
+            (0, 0)
         }
     }
 }
 
 // The Ty of one object (borrowed, possibly NULL). Holds the GIL.
-pub unsafe fn observe(obj: *mut PyObject) -> Ty {
-    Ty::Union(vec![kind(obj, false)])
+unsafe fn observe(obj: *mut PyObject) -> Ty {
+    Ty::One(kind(obj, false))
 }
 
 unsafe fn kind(obj: *mut PyObject, in_tuple: bool) -> Kind {
@@ -235,15 +391,7 @@ unsafe fn kind(obj: *mut PyObject, in_tuple: bool) -> Kind {
         return Kind::Bool(Konst::Is(obj == ffi::Py_True()));
     }
     if ffi::PyLong_CheckExact(obj) != 0 {
-        let mut overflow = 0;
-        let n = ffi::PyLong_AsLongLongAndOverflow(obj, &mut overflow);
-        return Kind::Int(match overflow {
-            0 => Interval::exact(n),
-            _ => Interval {
-                lo: i64::MIN,
-                hi: i64::MAX,
-            },
-        });
+        return Kind::Int(int_interval(obj));
     }
     if ffi::PyFloat_CheckExact(obj) != 0 {
         return Kind::Float;
@@ -259,7 +407,7 @@ unsafe fn kind(obj: *mut PyObject, in_tuple: bool) -> Kind {
         if in_tuple || n as usize > MAX_TUPLE {
             return Kind::VarTuple(Interval::exact(n as i64));
         }
-        return Kind::Tuple((0..n).map(|i| Ty::Union(vec![kind(ffi::PyTuple_GET_ITEM(obj, i), true)])).collect());
+        return Kind::Tuple((0..n).map(|i| Ty::One(kind(ffi::PyTuple_GET_ITEM(obj, i), true))).collect());
     }
     if ffi::PyList_CheckExact(obj) != 0 {
         return Kind::List(Interval::exact(ffi::PyList_GET_SIZE(obj) as i64));
@@ -274,6 +422,31 @@ unsafe fn kind(obj: *mut PyObject, in_tuple: bool) -> Kind {
         return Kind::Dict(Interval::exact(ffi::PyDict_Size(obj) as i64));
     }
     Kind::Object(Class::of(obj))
+}
+
+unsafe fn int_interval(obj: *mut PyObject) -> Interval {
+    let mut overflow = 0;
+    let n = ffi::PyLong_AsLongLongAndOverflow(obj, &mut overflow);
+    match overflow {
+        0 => Interval::exact(n),
+        _ => Interval { lo: i64::MIN, hi: i64::MAX },
+    }
+}
+
+// Whether str obj's value is s (by code point, as str_value reads it).
+unsafe fn str_equals(obj: *mut PyObject, s: &str) -> bool {
+    let n = ffi::PyUnicode_GET_LENGTH(obj);
+    if ffi::PyUnicode_IS_ASCII(obj) != 0 {
+        return n as usize == s.len() && std::slice::from_raw_parts(ffi::PyUnicode_1BYTE_DATA(obj), s.len()) == s.as_bytes();
+    }
+    let mut i = 0;
+    for c in s.chars() {
+        if i == n || ffi::PyUnicode_ReadChar(obj, i) != c as u32 {
+            return false;
+        }
+        i += 1;
+    }
+    i == n
 }
 
 // Read by code point: PyUnicode_AsUTF8AndSize would cache a UTF-8 copy in a
@@ -295,16 +468,7 @@ unsafe fn str_value(obj: *mut PyObject) -> Konst<String> {
 }
 
 unsafe fn tensor_ty(obj: *mut PyObject, t: &crate::bindings::ffi::Tensor) -> TensorTy {
-    let mut m = TensorMeta {
-        defined: false,
-        dtype: 0,
-        requires_grad: false,
-        has_device: false,
-        device_type: 0,
-        device_index: 0,
-        has_shape: false,
-        sizes: vec![],
-    };
+    let mut m = TensorMeta::default();
     tensor_meta(t, &mut m);
     let class = Class::of(obj);
     if !m.defined {
@@ -337,8 +501,8 @@ impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Ty::Any => write!(f, "Any"),
-            Ty::Union(alts) => {
-                for (i, k) in alts.iter().enumerate() {
+            Ty::One(_) | Ty::Union(_) => {
+                for (i, k) in self.kinds().into_iter().flatten().enumerate() {
                     if i > 0 {
                         write!(f, " | ")?;
                     }

@@ -84,6 +84,13 @@ void op_hook_enable() {
   }
 }
 
+void op_hook_pause(bool paused) {
+  if (state.depth > 0) {
+    c10::impl::tls_set_dispatch_key_included(
+        c10::DispatchKey::PreDispatch, paused ? state.was_included : true);
+  }
+}
+
 void op_hook_disable() {
   if (--state.depth == 0) {
     at::impl::set_pre_dispatch_hook(state.prev);

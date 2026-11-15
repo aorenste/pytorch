@@ -5,10 +5,10 @@ use std::os::raw::c_int;
 
 use pyo3::ffi::{self, PyObject};
 
+use crate::bindings::ffi as tffi;
 use crate::cfg::ir::*;
 
 use super::effects::{self, Recorder};
-use super::types;
 use super::ffi::*;
 use super::{Compiled, Prepared};
 
@@ -85,7 +85,9 @@ struct Act<'a> {
     names: *mut PyObject,
     vals: Vec<*mut PyObject>,
     tstate: *mut ffi::PyThreadState,
-    // Null when not recording (see RECORD).
+    // The activation's recorder (null when not recording, see recording()),
+    // and `rec`: the same, or null while running an optimized version.
+    scope_rec: *mut Recorder,
     rec: *mut Recorder,
     // The frame's prev_instr, the code units it points into, and the
     // interpreter's eval-breaker flag.
@@ -246,12 +248,13 @@ pub const FLAG_CALL: u8 = 4;
 pub const FLAG_CALL_EX: u8 = 8;
 pub const FLAG_YIELD: u8 = 16;
 
-// Runs `f` with a recorder for `table` at `site`, or with none if recording is off.
-fn recording<R>(table: &std::sync::Mutex<effects::Table>, site: Site, f: impl FnOnce(*mut Recorder) -> R) -> R {
-    if super::RECORD.load(std::sync::atomic::Ordering::Relaxed) {
-        effects::scope(table, site, f)
+// Runs `f` with a recorder for p's table at `site`, or with none on this
+// thread if p doesn't record or recording is off.
+fn recording<R>(p: &Prepared, site: Site, f: impl FnOnce(*mut Recorder) -> R) -> R {
+    if p.record && super::RECORD.load(std::sync::atomic::Ordering::Relaxed) {
+        effects::scope(&p.effects, site, f)
     } else {
-        f(std::ptr::null_mut())
+        effects::unrecorded(|| f(std::ptr::null_mut()))
     }
 }
 
@@ -261,7 +264,7 @@ pub unsafe fn run(c: &Compiled, prep: &Prepared, f: *mut Frame, start: Start) ->
         Start::Entry => Site::Block(ENTRY),
         Start::Resume { b, .. } => Site::Block(b),
     };
-    recording(&prep.effects, site, |rec| {
+    recording(prep, site, |rec| {
         let Bufs { vals, args, outs, edge } = Bufs::take(prep.cfg.instrs.len());
         let mut act = Act {
             p: prep,
@@ -272,6 +275,7 @@ pub unsafe fn run(c: &Compiled, prep: &Prepared, f: *mut Frame, start: Start) ->
             names: c.names.as_ptr(),
             vals,
             tstate: ffi::PyThreadState_Get(),
+            scope_rec: rec,
             rec,
             prev_instr: tr_frame_prev_instr_slot(f),
             code_units: tr_frame_code_units(f),
@@ -293,11 +297,53 @@ pub unsafe fn run(c: &Compiled, prep: &Prepared, f: *mut Frame, start: Start) ->
     })
 }
 
+// Runs a Cfg of aten ops (see graph.rs) on `inputs` (borrowed), outside any
+// frame: Ok(its outputs, owned), or Err with an exception set.
+pub unsafe fn run_graph(prep: &Prepared, inputs: &[*mut PyObject]) -> Result<Vec<*mut PyObject>, ()> {
+    let Bufs { vals, args, outs, edge } = Bufs::take(prep.cfg.instrs.len());
+    let mut dummy: *mut u16 = std::ptr::null_mut();
+    let mut act = Act {
+        p: prep,
+        cfg: &prep.cfg,
+        f: std::ptr::null_mut(),
+        locals: std::ptr::null_mut(),
+        consts: std::ptr::null_mut(),
+        names: std::ptr::null_mut(),
+        vals,
+        tstate: ffi::PyThreadState_Get(),
+        scope_rec: std::ptr::null_mut(),
+        rec: std::ptr::null_mut(),
+        prev_instr: &mut dummy,
+        code_units: std::ptr::null_mut(),
+        breaker_flag: std::sync::atomic::AtomicI32::from_ptr(tr_eval_breaker_flag(ffi::PyThreadState_Get())),
+        args,
+        outs,
+        edge,
+    };
+    for (obj, p) in inputs.iter().zip(&prep.cfg[ENTRY].params) {
+        act.set(*p, xincref(*obj));
+    }
+    let result = act.run_blocks(ENTRY, None);
+    act.into_bufs().give();
+    match result {
+        Outcome::Leave(outs) => Ok(outs),
+        Outcome::Error => Err(()),
+        _ => unreachable!("verified: a graph leaves"),
+    }
+}
+
 impl Act<'_> {
     // Points the frame at code unit `unit`, as if that instruction is executing.
+    // (Without a frame, prev_instr is a dummy and code_units null.)
     #[inline]
     unsafe fn set_instr(&self, unit: c_int) {
-        *self.prev_instr = self.code_units.add(unit as usize);
+        *self.prev_instr = self.code_units.wrapping_add(unit as usize);
+    }
+
+    unsafe fn traceback_here(&self) {
+        if !self.f.is_null() {
+            tr_traceback_here(self.f);
+        }
     }
 
     fn into_bufs(self) -> Bufs {
@@ -355,20 +401,16 @@ impl Act<'_> {
     // Joins v's current object into its type, if recording.
     #[inline]
     unsafe fn observe(&self, v: ValueId) {
-        if !self.rec.is_null() {
+        if !self.rec.is_null() && !(&*self.p.types.get())[v.idx()].skips(self.val(v)) {
             self.observe_slow(v);
         }
     }
 
     #[inline(never)]
     unsafe fn observe_slow(&self, v: ValueId) {
-        let ty = types::observe(self.val(v));
-        let mut table = self.p.types.lock().unwrap();
-        let slot = &mut table[v.idx()];
-        *slot = Some(match slot.take() {
-            Some(t) => t.join(ty),
-            None => ty,
-        });
+        // A Const is a co_consts object: the same immutable one every time.
+        let constant = matches!(self.cfg[v].op, Op::Const(_));
+        (&mut *self.p.types.get())[v.idx()].observe(self.val(v), constant);
     }
 
     // The args' objects, in self.args (valid until the next call).
@@ -473,6 +515,7 @@ impl Act<'_> {
 
     unsafe fn check(&self, b: BlockId, c: &Check) -> bool {
         let param = |i: &u32| self.val(self.cfg[b].params[*i as usize]);
+        let tensor = |o: *mut PyObject| tffi::tensor_by_type(o as usize).as_ref();
         match c {
             Check::PlainTensor(i) => super::is_plain_tensor(param(i)),
             Check::Exact(i, t) => {
@@ -483,22 +526,131 @@ impl Act<'_> {
                     Builtin::Bool => &raw mut ffi::PyBool_Type,
                 }
             }
-            Check::NoTorchFunctionMode => !crate::bindings::ffi::torch_function_mode_active(),
+            Check::NoTorchFunctionMode => !tffi::torch_function_mode_active(),
+            Check::GradEnabled(on) => tffi::grad_mode_enabled() == *on,
+            Check::RequiresGrad(i, on) => tensor(param(i)).is_some_and(|t| t.requires_grad() == *on),
+            Check::TensorMeta(i, m) => tensor(param(i))
+                .is_some_and(|t| tffi::tensor_matches(t, m.dtype, m.device_type, m.device_index, &m.sizes, &m.strides)),
+            Check::Value(i, l) => {
+                let o = param(i);
+                let tp = ffi::Py_TYPE(o);
+                match l {
+                    Lit::None => o == ffi::Py_None(),
+                    Lit::Bool(b) => o == if *b { ffi::Py_True() } else { ffi::Py_False() },
+                    Lit::Int(n) => {
+                        let mut overflow = 0;
+                        tp == &raw mut ffi::PyLong_Type
+                            && ffi::PyLong_AsLongLongAndOverflow(o, &mut overflow) == *n
+                            && overflow == 0
+                    }
+                    Lit::Float(bits) => tp == &raw mut ffi::PyFloat_Type && ffi::PyFloat_AsDouble(o).to_bits() == *bits,
+                    _ => false,
+                }
+            }
+            Check::NoForwardAD => !tffi::forward_ad_active(),
+            Check::NoSavedTensorHooks => !tffi::saved_tensor_hooks_active(),
+            Check::Pinned(k) => match &self.cfg.pins[*k as usize].path {
+                Some(path) => {
+                    !self.f.is_null()
+                        && tr_resolve_pin(self.f, path.global as c_int, path.attrs.as_ptr(), path.attrs.len() as isize)
+                            == self.p.pins[*k as usize].as_ptr()
+                }
+                None => false,
+            },
+            Check::Is(i, k) => param(i) == self.p.pins[*k as usize].as_ptr(),
+            Check::Null(i) => param(i).is_null(),
+            Check::Ints(i, tuple, ns) => {
+                let o = param(i);
+                let exact = if *tuple { ffi::PyTuple_CheckExact(o) } else { ffi::PyList_CheckExact(o) } != 0;
+                exact
+                    && ffi::Py_SIZE(o) as usize == ns.len()
+                    && ns.iter().enumerate().all(|(k, n)| {
+                        let x = if *tuple { ffi::PyTuple_GET_ITEM(o, k as isize) } else { ffi::PyList_GET_ITEM(o, k as isize) };
+                        let mut overflow = 0;
+                        ffi::Py_TYPE(x) == &raw mut ffi::PyLong_Type && ffi::PyLong_AsLongLongAndOverflow(x, &mut overflow) == *n && overflow == 0
+                    })
+            }
         }
     }
 
     // No version of `b` matched: run its origin on b's params, then continue
     // as b would with the outputs it leaves with.
     unsafe fn miss(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
+        self.p.misses[b.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let params = self.take_params(b);
+        let result = self.run_origin(b, params);
+        self.after_origin(b, result)
+    }
+
+    // Runs b's origin with its own autograd node (see autograd.rs).
+    unsafe fn bootstrap(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
+        let params = self.take_params(b);
+        let at = super::autograd::Where { code: tr_frame_code(self.f), prep: self.p as *const Prepared as usize, block: b };
+        // Params passed through as they are: those the guard pins down (a
+        // NULL, a pinned callee) and those no op reads (only carried along).
+        let blk = &self.cfg[b];
+        let read = |q: ValueId| blk.versions[0].body.iter().any(|v| self.cfg[*v].args.contains(&q));
+        let pinned: Vec<bool> = (0..params.len() as u32)
+            .map(|i| blk.versions[0].guard.checks.iter().any(|c| matches!(c, Check::Null(j) | Check::Is(j, _) if *j == i)) || !read(blk.params[i as usize]))
+            .collect();
+        let started = super::outside_executor(|| super::autograd::Bootstrap::start(&params, &pinned, at));
+        let result = match started {
+            Ok(None) => self.run_origin(b, params.iter().map(|p| xincref(*p)).collect()),
+            Ok(Some((boot, call))) => {
+                let result = super::outside_executor(|| self.run_origin(b, call));
+                match super::outside_executor(|| boot.finish(result)) {
+                    // The traced run raised, maybe only because it was traced
+                    // (a TorchDispatchMode needs the frame's globals to have
+                    // __builtins__): stop bootstrapping b, and run it as
+                    // usual, which raises again if the block itself does.
+                    r @ (Outcome::Error | Outcome::Outer(..)) => {
+                        if let Outcome::Outer(_, args) = r {
+                            args.into_iter().for_each(|a| ffi::Py_XDECREF(a));
+                        }
+                        let py = pyo3::Python::assume_attached();
+                        let why = pyo3::PyErr::take(py).map_or("?".into(), |e| e.to_string());
+                        self.p.autograd[b.idx()].store(false, std::sync::atomic::Ordering::Relaxed);
+                        *self.p.autograd_why[b.idx()].get() = Some(format!("the traced run raised {why}"));
+                        self.run_origin(b, params.iter().map(|p| xincref(*p)).collect())
+                    }
+                    r => r,
+                }
+            }
+            Err(e) => {
+                e.restore(pyo3::Python::assume_attached());
+                Outcome::Error
+            }
+        };
+        for p in params {
+            ffi::Py_XDECREF(p);
+        }
+        self.after_origin(b, result)
+    }
+
+    // Whether b's block may bootstrap now: its version's guard holds, grad
+    // mode is on and a tensor param requires grad.
+    unsafe fn wants_autograd(&self, b: BlockId) -> bool {
+        let blk = &self.cfg[b];
+        super::autograd::enabled()
+            && tffi::grad_mode_enabled()
+            && blk.versions[0].guard.checks.iter().all(|c| self.check(b, c))
+            && blk.params.iter().any(|p| tffi::tensor_by_type(self.val(*p) as usize).as_ref().is_some_and(|t| t.requires_grad()))
+    }
+
+    unsafe fn take_params(&mut self, b: BlockId) -> Vec<*mut PyObject> {
+        self.cfg[b].params.iter().map(|p| std::mem::replace(&mut self.vals[p.idx()], std::ptr::null_mut())).collect()
+    }
+
+    // Runs b's origin on `params` (owned).
+    unsafe fn run_origin(&self, b: BlockId, params: Vec<*mut PyObject>) -> Outcome {
         let origin = self.p.origins[b.idx()].as_ref().expect("verified: a block without a matching version has an origin");
-        let params: Vec<*mut PyObject> =
-            self.cfg[b].params.iter().map(|p| std::mem::replace(&mut self.vals[p.idx()], std::ptr::null_mut())).collect();
-        let result = recording(&origin.effects, Site::Block(ENTRY), |rec| {
+        recording(origin, Site::Block(ENTRY), |rec| {
             let Bufs { vals, args, outs, edge } = Bufs::take(origin.cfg.instrs.len());
             let mut sub = Act {
                 p: origin,
                 cfg: &origin.cfg,
                 vals,
+                scope_rec: rec,
                 rec,
                 args,
                 outs,
@@ -518,7 +670,11 @@ impl Act<'_> {
             let result = sub.run_blocks(ENTRY, None);
             sub.into_bufs().give();
             result
-        });
+        })
+    }
+
+    // Continues as b would after its origin ran with `result`.
+    unsafe fn after_origin(&mut self, b: BlockId, result: Outcome) -> Result<BlockId, Outcome> {
         match result {
             Outcome::Leave(outs) => {
                 let next = self.take_exit(b, &outs, None);
@@ -563,7 +719,7 @@ impl Act<'_> {
         };
         if let (Some(how), Some(unwind)) = (how, blk.term.unwind()) {
             if how == Exc::Error {
-                tr_traceback_here(self.f);
+                self.traceback_here();
             }
             let take = |os: &[OutIdx]| -> Vec<*mut PyObject> { os.iter().map(|o| xincref(out(o))).collect() };
             let TermUnwind::Block(k, args) = unwind else {
@@ -638,7 +794,7 @@ impl Act<'_> {
         if how == Exc::Error {
             // A failure replaces the pending exception, which is what CPython
             // does too.
-            tr_traceback_here(self.f);
+            self.traceback_here();
         }
         let cfg = self.cfg;
         let blk = &cfg[b];
@@ -683,11 +839,27 @@ impl Act<'_> {
         let cfg = self.cfg;
         'blocks: loop {
             let blk = &cfg[b];
+            // An optimized block (one with an origin) doesn't record.
+            let rec = if self.p.origins[b.idx()].is_some() { std::ptr::null_mut() } else { self.scope_rec };
+            if rec != self.rec {
+                if let Some(old) = self.rec.as_mut() {
+                    old.flush();
+                }
+                effects::set_current(rec);
+                self.rec = rec;
+            }
             if let Some(rec) = self.rec.as_mut() {
                 rec.at(Site::Block(b));
             }
             let (vi, first) = match resume.take() {
                 Some(r) => r,
+                None if self.p.autograd[b.idx()].load(std::sync::atomic::Ordering::Relaxed) && self.wants_autograd(b) => match self.bootstrap(b) {
+                    Ok(next) => {
+                        b = next;
+                        continue 'blocks;
+                    }
+                    Err(outcome) => return outcome,
+                },
                 None => match self.select(b) {
                     Some(vi) => (vi, 0),
                     None => match self.miss(b) {
@@ -884,10 +1056,43 @@ impl Act<'_> {
                 check(tr_call(self.args(ins), *argc as c_int, kw))?
             }
             Op::Binary(k) => check(tr_binary_op(*k as c_int, a(0), a(1)))?,
-            Op::Aten(_) => {
-                let f = self.p.aten[&v].as_ptr();
+            Op::Aten { .. } => {
+                let (f, kw) = &self.p.aten[&v];
+                let (kw, nkw) = kw.as_ref().map_or((std::ptr::null_mut(), 0), |k| (k.as_ptr(), ffi::PyTuple_GET_SIZE(k.as_ptr()) as usize));
                 let args = self.args(ins);
-                check(ffi::PyObject_Vectorcall(f, args, ins.args.len(), std::ptr::null_mut()))?
+                let r = check(ffi::PyObject_Vectorcall(f.as_ptr(), args, ins.args.len() - nkw, kw))?;
+                if self.p.projects[v.idx()].is_empty() {
+                    r
+                } else {
+                    // A tuple or (Tensor[]) list of the outputs.
+                    let n = ffi::PySequence_Size(r);
+                    let outs: Vec<*mut PyObject> = (0..n.max(0)).map(|k| ffi::PySequence_GetItem(r, k)).collect();
+                    ffi::Py_DECREF(r);
+                    if n < 0 || outs.iter().any(|o| o.is_null()) || outs.len() != self.p.projects[v.idx()].len() {
+                        if n >= 0 && ffi::PyErr_Occurred().is_null() {
+                            super::fail("CFG executor: an aten op returned an unexpected number of outputs", ffi::PyExc_RuntimeError);
+                        }
+                        outs.into_iter().for_each(|o| ffi::Py_XDECREF(o));
+                        return Err(Exc::Error);
+                    }
+                    self.distribute(v, &outs);
+                    return Ok(());
+                }
+            }
+            Op::Lit(i) => xincref(self.p.literals[*i as usize].as_ptr()),
+            Op::Pinned(i) => xincref(self.p.pins[*i as usize].as_ptr()),
+            Op::Autograd(t) => {
+                let params: Vec<*mut PyObject> = ins.args.iter().map(|a| self.val(*a)).collect();
+                match super::autograd::forward(&self.p.trainings[*t as usize], &params) {
+                    Ok(outs) => {
+                        self.distribute(v, &outs);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        e.restore(pyo3::Python::assume_attached());
+                        return Err(Exc::Error);
+                    }
+                }
             }
             Op::Compare(k) => check(ffi::PyObject_RichCompare(a(0), a(1), *k as c_int))?,
             Op::BuildTuple(n) => {

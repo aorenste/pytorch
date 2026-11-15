@@ -162,6 +162,8 @@ pub fn outline(cfg: &mut Cfg, chain: &[BlockId], mode: Outline) {
 // handlers go to the owner's.
 fn extract(cfg: &Cfg, chain: &[BlockId], handlers: &[BlockId]) -> Cfg {
     let mut sub = Cfg::new(cfg.slot_names.clone(), cfg.const_reprs.clone(), cfg.names.clone());
+    sub.literals = cfg.literals.clone();
+    sub.trainings = cfg.trainings.clone();
     let last = &cfg[*chain.last().unwrap()];
     sub.boundary = Some(Boundary {
         n_outputs: last.n_outputs(),

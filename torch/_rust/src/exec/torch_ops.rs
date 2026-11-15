@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use pyo3::prelude::*;
 
 use super::ffi::{tr_current_frame, tr_frame_code, tr_frame_get_instr, PyCode_Addr2Line};
-use crate::bindings::ffi::op_hook::{op_hook_disable, op_hook_enable};
+use crate::bindings::ffi::op_hook::{op_hook_disable, op_hook_enable, op_hook_pause};
 
 static PRINT_TORCH_OPS: AtomicBool = AtomicBool::new(false);
 
@@ -22,12 +22,16 @@ pub fn printing() -> bool {
     PRINT_TORCH_OPS.load(Ordering::Relaxed)
 }
 
-// Keeps the hook enabled on this thread for its lifetime.
+// Keeps the hook enabled on this thread for its lifetime; it runs only while
+// effects are recorded (see effects::set_current) or ops printed.
 pub struct OpHookGuard;
 
 impl OpHookGuard {
     pub fn new() -> Self {
         op_hook_enable();
+        if !super::effects::has_current() && !printing() {
+            op_hook_pause(true);
+        }
         OpHookGuard
     }
 }

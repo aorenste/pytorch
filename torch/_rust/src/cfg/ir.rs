@@ -5,7 +5,7 @@
 // CPython's lifetimes and stay visible to frame introspection.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
@@ -127,10 +127,22 @@ pub enum Op {
     DeleteDeref { slot: u32 },
     LoadFromDictOrDeref { slot: u32 },
     Bytecode { opcode: u8, arg: u32 },
-    // Calls an aten operator overload ("aten::add.Tensor") on the args, in
-    // schema order, other args taking their defaults. An optimized version's
-    // stand-in for the Python-level op that ran it (see cfg/optimize.rs).
-    Aten(String),
+    // Calls an aten operator overload ("aten::add.Tensor") on the args: in
+    // schema order, the last kwnames.len() by those names, other args taking
+    // their defaults. An optimized version's stand-in for the Python-level op
+    // that ran it (see cfg/optimize.rs), or an op of a traced graph. An
+    // overload returning several values (a tuple or Tensor[]) hands them to
+    // its Projects.
+    Aten { name: String, kwnames: Vec<String> },
+    // Cfg::literals[i].
+    Lit(u32),
+    // The object Cfg::pins[i] resolved to when it was pinned (a version's
+    // guard checks it still does).
+    Pinned(u32),
+    // Runs Cfg::trainings[i] on the block's params (its args), handing each
+    // block output to its Project: the forward of a pure block, with its own
+    // autograd node (see exec/autograd.rs).
+    Autograd(u32),
     Removed,
 }
 
@@ -141,6 +153,8 @@ impl Op {
             | Op::Unknown
             | Op::Param(_)
             | Op::Const(_)
+            | Op::Lit(_)
+            | Op::Pinned(_)
             | Op::Project(_)
             | Op::IsNone
             | Op::LoadLocal { .. }
@@ -170,7 +184,8 @@ impl Op {
             | Op::LoadDeref { .. }
             | Op::DeleteDeref { .. }
             | Op::LoadFromDictOrDeref { .. }
-            | Op::Aten(_) => true,
+            | Op::Aten { .. }
+            | Op::Autograd(_) => true,
             Op::Bytecode { opcode, .. } => opcodes::generic_can_raise(*opcode),
         }
     }
@@ -257,6 +272,114 @@ pub enum Check {
     Exact(u32, Builtin),
     // No __torch_function__ mode would intercept torch calls.
     NoTorchFunctionMode,
+    // Grad mode is on (true) or off.
+    GradEnabled(bool),
+    // A tensor param requires grad (true) or doesn't.
+    RequiresGrad(u32, bool),
+    // A plain strided tensor with exactly this dtype, device, sizes and strides.
+    TensorMeta(u32, Box<TensorSpec>),
+    // Exactly this scalar: same type, and the same value (floats bitwise).
+    Value(u32, Lit),
+    // No forward-mode AD level is open.
+    NoForwardAD,
+    // No saved_tensors_hooks would pack tensors saved for backward.
+    NoSavedTensorHooks,
+    // Cfg::pins[i]'s path still resolves to the object it was pinned to.
+    Pinned(u32),
+    // A param is (by identity) the object Cfg::pins[i] was pinned to.
+    Is(u32, u32),
+    // A param is CPython's NULL (a LoadMethod's empty self slot).
+    Null(u32),
+    // A param is exactly a tuple (true) or list of exactly these ints.
+    Ints(u32, bool, Vec<i64>),
+}
+
+impl Check {
+    // The param it checks, if any.
+    pub fn param(&self) -> Option<u32> {
+        match self {
+            Check::PlainTensor(p)
+            | Check::Exact(p, _)
+            | Check::RequiresGrad(p, _)
+            | Check::TensorMeta(p, _)
+            | Check::Value(p, _)
+            | Check::Is(p, _)
+            | Check::Null(p)
+            | Check::Ints(p, _, _) => Some(*p),
+            Check::NoTorchFunctionMode
+            | Check::GradEnabled(_)
+            | Check::NoForwardAD
+            | Check::NoSavedTensorHooks
+            | Check::Pinned(_) => None,
+        }
+    }
+}
+
+// c10's ScalarType and DeviceType enums.
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug)]
+pub struct TensorSpec {
+    pub dtype: i8,
+    pub device_type: i8,
+    pub device_index: i8,
+    pub sizes: Vec<i64>,
+    pub strides: Vec<i64>,
+}
+
+// An object an optimized version holds (see cfg/optimize.rs), named for
+// printing, and where it was read from if that can be checked again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Pin {
+    pub name: String,
+    pub path: Option<PinPath>,
+}
+
+// A global (in the frame's globals, then builtins) and the attributes read
+// from it in turn, each through a module's __dict__: `F.linear` is
+// (F, [linear]). Names are indices into Cfg::names.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PinPath {
+    pub global: u32,
+    pub attrs: Vec<u32>,
+}
+
+// A Python value an op takes as is.
+#[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Debug)]
+pub enum Lit {
+    None,
+    Bool(bool),
+    Int(i64),
+    // An f64's bits, so that Lit is Eq and a guard compares bitwise.
+    Float(u64),
+    Str(String),
+    IntList(Vec<i64>),
+    FloatList(Vec<u64>),
+    BoolList(Vec<bool>),
+    // By name: torch.<name> for dtypes, layouts and memory formats, and
+    // torch.device(<name>).
+    Dtype(String),
+    Layout(String),
+    MemoryFormat(String),
+    Device(String),
+}
+
+impl fmt::Display for Lit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Lit::None => write!(f, "None"),
+            Lit::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
+            Lit::Int(i) => write!(f, "{i}"),
+            Lit::Float(bits) => write!(f, "{:?}", f64::from_bits(*bits)),
+            Lit::Str(x) => write!(f, "{x:?}"),
+            Lit::IntList(xs) => write!(f, "{xs:?}"),
+            Lit::FloatList(xs) => write!(f, "{:?}", xs.iter().map(|b| f64::from_bits(*b)).collect::<Vec<_>>()),
+            Lit::BoolList(xs) => {
+                let xs: Vec<&str> = xs.iter().map(|b| if *b { "True" } else { "False" }).collect();
+                write!(f, "[{}]", xs.join(", "))
+            }
+            Lit::Dtype(x) | Lit::Layout(x) | Lit::MemoryFormat(x) => write!(f, "torch.{x}"),
+            Lit::Device(x) => write!(f, "device({x:?})"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Debug)]
@@ -471,6 +594,42 @@ pub struct Cfg {
     pub slot_names: Vec<String>,
     pub const_reprs: Vec<String>,
     pub names: Vec<String>,
+    // What Op::Lit instrs hold.
+    pub literals: Vec<Lit>,
+    // What Op::Pinned instrs hold and Check::Pinned checks.
+    pub pins: Vec<Pin>,
+    // What Op::Autograd instrs run.
+    pub trainings: Vec<Arc<Training>>,
+}
+
+// A pure block's forward and backward, split from its joint graph (see
+// cfg/partition.rs), for an Op::Autograd.
+#[derive(Debug)]
+pub struct Training {
+    // Graphs of aten ops (see exec/graph.rs). The forward takes the block's
+    // tensor params and leaves with its tensor outputs, then the values saved
+    // for the backward; the backward takes those saved values, then the
+    // gradients of the outputs given the node, and leaves with the gradients
+    // of the params that require grad.
+    pub forward: Arc<Cfg>,
+    pub backward: Arc<Cfg>,
+    // The block's params that are tensors, in the forward's order.
+    pub tensor_params: Vec<u32>,
+    // Which of those require grad.
+    pub requires_grad: Vec<bool>,
+    // By forward output: whether it's given the node (it requires grad).
+    pub wrap: Vec<bool>,
+    // How each block output is made.
+    pub outputs: Vec<Template>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Template {
+    Param(u32),
+    // A forward output.
+    Out(u32),
+    Lit(Lit),
+    Tuple(Vec<Template>),
 }
 
 impl Index<ValueId> for Cfg {
@@ -520,6 +679,9 @@ impl Cfg {
             slot_names,
             const_reprs,
             names,
+            literals: vec![],
+            pins: vec![],
+            trainings: vec![],
         }
     }
 
@@ -827,6 +989,10 @@ impl<'a> Printer<'a> {
         self.cfg.names.get(i as usize).map_or("?", |s| s.as_str())
     }
 
+    fn pin(&self, i: u32) -> &str {
+        self.cfg.pins.get(i as usize).map_or("?", |p| p.name.as_str())
+    }
+
     fn slot(&self, i: u32) -> &str {
         self.cfg.slot_names.get(i as usize).map_or("?", |s| s.as_str())
     }
@@ -890,7 +1056,11 @@ impl<'a> Printer<'a> {
             Op::DeleteDeref { slot } => format!("DeleteDeref {}", self.slot(*slot)),
             Op::LoadFromDictOrDeref { slot } => format!("LoadFromDictOrDeref {}", self.slot(*slot)),
             Op::Bytecode { opcode, arg } => format!("{} {arg}", opcodes::name(*opcode)),
-            Op::Aten(name) => format!("Aten {name}"),
+            Op::Aten { name, kwnames } if kwnames.is_empty() => format!("Aten {name}"),
+            Op::Aten { name, kwnames } => format!("Aten {name} kw[{}]", kwnames.join(", ")),
+            Op::Lit(i) => format!("Lit {}", self.cfg.literals.get(*i as usize).map_or("?".into(), |l| l.to_string())),
+            Op::Pinned(i) => format!("Pinned {}", self.pin(*i)),
+            Op::Autograd(i) => format!("Autograd t{i}"),
             Op::Removed => "Removed".into(),
         }
     }
@@ -984,6 +1154,29 @@ impl<'a> Printer<'a> {
                 Check::PlainTensor(i) => format!("plain_tensor({})", param(i)),
                 Check::Exact(i, t) => format!("{}({})", format!("{t:?}").to_lowercase(), param(i)),
                 Check::NoTorchFunctionMode => "no_torch_function_mode".into(),
+                Check::GradEnabled(on) => if *on { "grad_enabled" } else { "grad_disabled" }.into(),
+                Check::RequiresGrad(i, on) => format!("{}({})", if *on { "requires_grad" } else { "no_requires_grad" }, param(i)),
+                Check::TensorMeta(i, t) => {
+                    format!(
+                        "tensor({} {} {} {:?} stride {:?})",
+                        param(i),
+                        crate::bindings::ffi::dtype_name(t.dtype),
+                        crate::bindings::ffi::device_name(t.device_type, t.device_index),
+                        t.sizes,
+                        t.strides
+                    )
+                }
+                Check::Value(i, l) => format!("value({} == {l})", param(i)),
+                Check::NoForwardAD => "no_forward_ad".into(),
+                Check::NoSavedTensorHooks => "no_saved_tensor_hooks".into(),
+                Check::Pinned(i) => format!("pinned({})", self.pin(*i)),
+                Check::Is(p, i) => format!("is({}, {})", param(p), self.pin(*i)),
+                Check::Null(p) => format!("null({})", param(p)),
+                Check::Ints(p, tuple, ns) => {
+                    let ns: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
+                    let (l, r) = if *tuple { ("(", if ns.len() == 1 { ",)" } else { ")" }) } else { ("[", "]") };
+                    format!("value({} == {l}{}{r})", param(p), ns.join(", "))
+                }
             })
             .collect();
         format!(" [guard: {}]", checks.join(", "))
@@ -1044,6 +1237,12 @@ impl<'a> Printer<'a> {
                 let _ = writeln!(out, "{inner}origin:");
                 Printer::new(origin, self.raw, self.origins, self.ann).render(out, &deeper);
             }
+        }
+        for (i, t) in self.cfg.trainings.iter().enumerate() {
+            let _ = writeln!(out, "{indent}t{i} forward:");
+            Printer::new(&t.forward, self.raw, self.origins, &()).render(out, &deeper);
+            let _ = writeln!(out, "{indent}t{i} backward:");
+            Printer::new(&t.backward, self.raw, self.origins, &()).render(out, &deeper);
         }
     }
 }

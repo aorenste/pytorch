@@ -37,6 +37,10 @@ PyCodeObject* tr_frame_code(_PyInterpreterFrame* f) {
   return f->f_code;
 }
 
+PyObject* tr_frame_qualname(_PyInterpreterFrame* f) {
+  return f->f_code->co_qualname;
+}
+
 PyObject** tr_frame_localsplus(_PyInterpreterFrame* f) {
   return f->localsplus;
 }
