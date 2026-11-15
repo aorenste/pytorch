@@ -64,6 +64,12 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
         if checked.any(|p| p as usize >= blk.params.len()) {
             return Err(format!("bb{i}: a guard checks a missing param"));
         }
+        for v in &blk.versions {
+            let expects = v.body.iter().any(|x| matches!(cfg[*x].op, Op::Expect(_) | Op::ExpectIs(_) | Op::ExpectCheck(_) | Op::ExpectTypeAttr { .. } | Op::ExpectGetattr { .. }));
+            if (expects || v.restart) && (blk.origin.is_none() || !v.restart) {
+                return Err(format!("bb{i}: a version with Expects or that restarts needs both an origin and restart"));
+            }
+        }
         let n = blk.n_outputs();
         if blk.versions.iter().any(|v| v.outputs.len() != n) {
             return Err(format!("bb{i}: versions disagree on the number of outputs"));

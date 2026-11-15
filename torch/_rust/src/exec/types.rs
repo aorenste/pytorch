@@ -30,7 +30,7 @@ pub struct Interval {
 }
 
 impl Interval {
-    fn exact(n: i64) -> Self {
+    pub fn exact(n: i64) -> Self {
         Interval { lo: n, hi: n }
     }
 

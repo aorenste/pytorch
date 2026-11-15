@@ -11,6 +11,7 @@ import io
 import re
 import signal
 import sys
+import traceback
 import types
 import unittest
 import weakref
@@ -1657,6 +1658,19 @@ bb4:
         with self.assertRaisesRegex(ValueError, "no block bb9"):
             torch._rust.optimize_block(f, 9)
 
+    def test_optimize_keeps_values_handlers_use(self):
+        # The first list is a dead store, but it's dims' value if LIST_EXTEND
+        # raises, so the pure block keeps it for the handler.
+        def f(flag):
+            dims = []
+            dims = [(None, 0), (0, None), (1, 1)]
+            if flag:
+                return dims
+
+        self.same(f, True)
+        torch._rust.optimize_block(f, 0)
+        self.same(f, True)
+
     def test_optimize_block_under_suspended_generator(self):
         def gen(n):
             t = n + 1
@@ -2699,6 +2713,317 @@ t0 backward:
             self.assertIn("pinned(F.relu)", torch._rust.cfg_observed(f))
         finally:
             torch._rust._set_cfg_autograd(False)
+
+    def test_reoptimize(self):
+        # Optimizing again starts from the unoptimized CFG: the result is what
+        # the first optimization made (nothing new was observed), pinned
+        # callees and all, and it still trains.
+        def f(x, w):
+            return F.relu(x @ w) * 2
+
+        x, w = torch.randn(3, 3), torch.randn(3, 3)
+        self.same(f, x, w)
+        self.optimize_all(f)
+        first = torch._rust.cfg_observed(f, False, False)
+        torch._rust._reoptimize(f)
+        self.assertEqual(torch._rust.cfg_observed(f, False, False), first)
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, x, w), f(x, w))
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(3):
+                a = w.clone().requires_grad_()
+                torch._rust.call_with_cfg_execution(f, x, a).sum().backward()
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_clones(self):
+        # After optimizing, each call site of a Python function gets its own
+        # clone of the callee's CFG, which records only that site's visits.
+        def g(a):
+            return a + 1
+
+        def f(x, y):
+            return g(x), g(y)
+
+        self.same(f, 1, 2.0)
+        self.optimize_all(f)
+        clones = torch._rust._cfg_clones(f)
+        self.assertEqual([q for _, q in clones], [g.__qualname__] * 2)
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, 3, 4.5), (4, 5.5))
+        (v1, _), (v2, _) = clones
+        self.assertIn("int 4 = BinaryOp +", torch._rust.cfg_observed(f, clone=[v1]))
+        self.assertIn("float = BinaryOp +", torch._rust.cfg_observed(f, clone=[v2]))
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, 1.5, 2), (2.5, 3))
+
+        # A cloned site that calls another function runs that function.
+        def h1(a):
+            return a + 1
+
+        def h2(a):
+            return a * 10
+
+        def k(h, a):
+            return h(a)
+
+        self.same(k, h1, 1)
+        self.optimize_all(k)
+        self.assertEqual([q for _, q in torch._rust._cfg_clones(k)], [h1.__qualname__])
+        self.assertEqual(torch._rust.call_with_cfg_execution(k, h2, 2), 20)
+        self.assertEqual(torch._rust.call_with_cfg_execution(k, h1, 2), 3)
+
+    def test_restart(self):
+        # A version that restarts runs its block's origin from the start when
+        # an Expect fails or anything raises: same results, CPython's
+        # exception and traceback, and the abort counted.
+        def f(x, w):
+            return x @ w * 2
+
+        x, w = torch.randn(3, 3), torch.randn(3, 3)
+        self.same(f, x, w)
+        self.optimize_all(f)
+        torch._rust._add_block_checks(f, 1, [("expect_is", 1, w)])
+        self.assertIn("(restarts)", torch._rust.cfg_observed(f))
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, x, w), f(x, w))
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 0)
+        w2 = torch.randn(3, 3)
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, x, w2), f(x, w2))
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 1)
+        bad = torch.randn(2, 2)
+        try:
+            torch._rust.call_with_cfg_execution(f, x, bad)
+            self.fail("no exception")
+        except RuntimeError as e:
+            self.assertIn("cannot be multiplied", str(e))
+            tb = traceback.extract_tb(e.__traceback__)
+        self.assertEqual(tb[-1].name, "f")
+        self.assertEqual(tb[-1].line, "return x @ w * 2")
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 2)
+        self.assertEqual(torch._rust._cfg_misses(f)[1], 0)
+
+    def test_elide(self):
+        # A call of a Python function whose clone's path can be copied in is
+        # elided: its body joins the caller's pure block, behind checks that
+        # the callee and its defaults are the ones observed; a check failing
+        # or anything raising runs the block's origin (the real call).
+        ns = {"torch": torch}
+        exec(
+            "def helper(t, s=2):\n    return torch.relu(t) * s\n\n"
+            "def f(x, w):\n    return helper(x @ w) + 1\n",
+            ns,
+        )
+        f = ns["f"]
+        x, w = torch.randn(3, 3), torch.randn(3, 3)
+        expected = f(x, w)
+        torch._rust.call_with_cfg_execution(f, x, w)
+        self.optimize_all(f)
+        torch._rust.call_with_cfg_execution(f, x, w)
+        torch._rust._set_cfg_elide(True)
+        try:
+            torch._rust._reoptimize(f)
+        finally:
+            torch._rust._set_cfg_elide(False)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f, False, False).split("origin:")[0],
+            """\
+bb0:
+  %0 = LoadLocal x
+  %1 = LoadLocal w
+  jump bb1(s0=%0, s1=%1)
+bb1(%2 s0, %3 s1):
+  version [guard: pinned(torch.relu), plain_tensor(s0), plain_tensor(s1), no_torch_function_mode] (restarts):
+    Resume
+    %4 = LoadGlobal helper
+    ExpectIs helper %4
+    %5 = Pinned helper
+    %6 = LoadAttr __defaults__ %5
+    ExpectIs __defaults__ %6
+    %7 = Pinned 2
+    %8 = Pinned torch.relu
+    %9 = Const 1
+    %10 = Aten aten::matmul %2, %3
+    %11 = Call 1 null, %8, %10
+    %12 = Aten aten::mul.Tensor %11, %7
+    %13 = Aten aten::add.Tensor %12, %9
+    outputs [%13]
+  jump bb2(s0=o0)
+  """,
+        )
+        run = lambda *a: torch._rust.call_with_cfg_execution(f, *a)  # noqa: E731
+        self.assertEqual(run(x, w), expected)
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 0)
+        # A different default: the defaults check fails.
+        helper, defaults = ns["helper"], ns["helper"].__defaults__
+        helper.__defaults__ = (3,)
+        self.assertEqual(run(x, w), torch.relu(x @ w) * 3 + 1)
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 1)
+        # A different callee.
+        ns["helper"] = lambda t: t
+        self.assertEqual(run(x, w), x @ w + 1)
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 2)
+        # A raise in the elided code gives CPython's traceback, through the
+        # callee's frame.
+        ns["helper"], helper.__defaults__ = helper, defaults
+        self.assertEqual(run(x, w), expected)
+        c = torch.randn(3, 3, dtype=torch.complex64)
+        try:
+            run(c, c)
+            self.fail("no exception")
+        except RuntimeError as e:
+            tb = traceback.extract_tb(e.__traceback__)
+            self.assertEqual([t.name for t in tb[-2:]], ["f", "helper"])
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 3)
+
+    def elide(self, f, *args):
+        # Runs f, optimizes it (giving its call sites clones), runs it again
+        # (so the clones observe), and optimizes it again with elision on.
+        torch._rust.call_with_cfg_execution(f, *args)
+        self.optimize_all(f)
+        torch._rust.call_with_cfg_execution(f, *args)
+        torch._rust._set_cfg_elide(True)
+        try:
+            torch._rust._reoptimize(f)
+        finally:
+            torch._rust._set_cfg_elide(False)
+
+    def test_elide_autograd(self):
+        # An elided block trains: its training version runs the read prefix,
+        # then its node's forward on the params and what the prefix read; a
+        # tensor read there (W) gets in-body checks and its gradient.
+        ns = {"torch": torch, "W": torch.randn(3, 3, requires_grad=True)}
+        exec(
+            "def helper(t):\n    return torch.relu(t @ W)\n\n"
+            "def f(x):\n    return helper(x) * 2\n",
+            ns,
+        )
+        f, W = ns["f"], ns["W"]
+        x = torch.randn(3, 3)
+        self.elide(f, x)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(3):
+                W.grad = None
+                torch._rust.call_with_cfg_execution(f, x).sum().backward()
+                got, W.grad = W.grad, None
+                f(x).sum().backward()
+                self.assertEqual(got, W.grad)
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            training = torch._rust.cfg_observed(f, False, False).split("Autograd")[0]
+            self.assertIn(
+                "ExpectCheck tensor(_ f32 cpu [3, 3] stride [3, 1])", training
+            )
+            # A W of another shape fails the check: the origin runs.
+            ns["W"] = torch.randn(3, 2, requires_grad=True)
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, x), f(x))
+            self.assertEqual(torch._rust._cfg_aborts(f)[1], 1)
+        finally:
+            torch._rust._set_cfg_autograd(False)
+
+    def test_elide_abort_keeps_params(self):
+        # An elided version that never reads a param (here self, bound but
+        # unused) still runs its origin on it when a check fails.
+        class T:
+            def m(self):
+                return 1
+
+        class U:
+            def m(self):
+                return 2
+
+        def f(t):
+            return t.m()
+
+        self.elide(f, T())
+        self.assertIn("(restarts)", torch._rust.cfg_observed(f, False, False))
+        self.assertEqual(torch._rust.call_with_cfg_execution(f, U()), 2)
+        self.assertEqual(torch._rust._cfg_aborts(f)[1], 1)
+
+    def test_elide_module(self):
+        # A module call is elided through _wrapped_call_impl, _call_impl,
+        # forward and __getattr__ (clones of each, optimized again once they
+        # observed), and trains; a hook added later, or an instance forward,
+        # fails a check and the real call runs.
+        lin = torch.nn.Linear(4, 3)
+
+        def f(x):
+            return lin(x) * 2
+
+        x = torch.randn(2, 4)
+        torch._rust._set_cfg_optimize(True)
+        torch._rust._set_cfg_elide(True)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(15):
+                lin.zero_grad()
+                torch._rust.call_with_cfg_execution(f, x).sum().backward()
+                got = [p.grad for p in lin.parameters()]
+                lin.zero_grad()
+                f(x).sum().backward()
+                self.assertEqual(got, [p.grad for p in lin.parameters()])
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            out = torch._rust.cfg_observed(f, False, False).split("origin:")[0]
+            self.assertIn(
+                "ExpectTypeAttr __call__ torch.nn.modules.module.Module._wrapped_call_impl",
+                out,
+            )
+            self.assertIn(
+                "ExpectGetattr weight torch.nn.modules.module.Module.__getattr__", out
+            )
+            self.assertIn("Autograd", out)
+            seen = []
+            h = lin.register_forward_hook(lambda m, i, o: seen.append(1))
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, x), f(x))
+            self.assertEqual(seen, [1, 1])
+            self.assertEqual(torch._rust._cfg_aborts(f)[1], 1)
+            h.remove()
+            lin.forward = lambda t: t[:, :3]
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, x), x[:, :3] * 2)
+            self.assertEqual(torch._rust._cfg_aborts(f)[1], 2)
+        finally:
+            torch._rust._set_cfg_optimize(False)
+            torch._rust._set_cfg_elide(False)
+            torch._rust._set_cfg_autograd(False)
+
+    def test_callee_via_type(self):
+        # Calling an instance records its class's __call__, and an attribute
+        # load from an instance records its class's __getattr__ (entered,
+        # directly, only when the generic lookup missed).
+        class C:
+            def __call__(self, x):
+                return x + 1
+
+            def __getattr__(self, name):
+                return 2
+
+        def f(c):
+            return c(c.missing) + c.present
+
+        c = C()
+        c.present = 3
+        self.same(f, c)
+        out = re.sub(r"\S*<locals>\.", "", torch._rust.cfg_observed(f))
+        self.assertExpectedInline(
+            out,
+            """\
+bb0:
+  Resume
+  %0: C = LoadLocal c
+  %1: C = LoadLocal c
+  %2: int 2 = LoadAttr missing %1
+      callee C.__getattr__ (via __getattr__)
+      effects [1 visit]:
+        call C.__getattr__
+  %3: int 3 = Call 1 null, %0, %2
+      callee C.__call__ (via __call__)
+      effects [1 visit]:
+        call C.__call__
+  %4: C = LoadLocal c
+  %5: int 3 = LoadAttr present %4
+      callee C.__getattr__ (via __getattr__)
+  %6: int 6 = BinaryOp + %3, %5
+  return %6
+""",
+        )
 
     def test_autograd_int_tuple_param(self):
         # A tuple of ints a training version bakes in is guarded by value.

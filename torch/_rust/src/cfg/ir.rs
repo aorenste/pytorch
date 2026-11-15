@@ -95,6 +95,10 @@ pub enum Op {
     StoreLocal { slot: u32 },
     DeleteLocal { slot: u32 },
     LoadGlobal(u32),
+    // A global (Cfg::names[name]) read from the dicts Cfg::pins[globals]
+    // and [builtins] instead of the frame's: code inlined from another
+    // function. Uncached.
+    LoadGlobalIn { name: u32, globals: u32, builtins: u32 },
     LoadAttr(u32),
     LoadMethod(u32),
     StoreAttr(u32),
@@ -139,6 +143,23 @@ pub enum Op {
     // The object Cfg::pins[i] resolved to when it was pinned (a version's
     // guard checks it still does).
     Pinned(u32),
+    // Checks that its arg is True (true) or False, and that it is (by
+    // identity) the object Cfg::pins[i]. A failing check aborts the version
+    // (see Version::restart). In-body counterparts of a guard, for values
+    // the version computes.
+    Expect(bool),
+    ExpectIs(u32),
+    // Checks that its arg's class runs Cfg::pins[pin] for Cfg::names[name]
+    // (looked up on the class, as for a special method like __call__).
+    ExpectTypeAttr { name: u32, pin: u32 },
+    // Checks that loading Cfg::names[name] from its arg falls back to its
+    // class's __getattr__, which is Cfg::pins[pin]: the class has the
+    // generic __getattribute__ and nothing by that name, and neither has the
+    // instance's __dict__.
+    ExpectGetattr { name: u32, pin: u32 },
+    // A guard check on its arg instead of a param (the check's param index
+    // is unused): a training version's checks on what its read prefix read.
+    ExpectCheck(Box<Check>),
     // Runs Cfg::trainings[i] on the block's params (its args), handing each
     // block output to its Project: the forward of a pure block, with its own
     // autograd node (see exec/autograd.rs).
@@ -169,6 +190,7 @@ impl Op {
             | Op::LoadLocalChecked { .. }
             | Op::DeleteLocal { .. }
             | Op::LoadGlobal(_)
+            | Op::LoadGlobalIn { .. }
             | Op::LoadAttr(_)
             | Op::LoadMethod(_)
             | Op::StoreAttr(_)
@@ -185,6 +207,11 @@ impl Op {
             | Op::DeleteDeref { .. }
             | Op::LoadFromDictOrDeref { .. }
             | Op::Aten { .. }
+            | Op::Expect(_)
+            | Op::ExpectIs(_)
+            | Op::ExpectCheck(_)
+            | Op::ExpectTypeAttr { .. }
+            | Op::ExpectGetattr { .. }
             | Op::Autograd(_) => true,
             Op::Bytecode { opcode, .. } => opcodes::generic_can_raise(*opcode),
         }
@@ -202,6 +229,11 @@ impl Op {
             | Op::DeleteDeref { .. }
             | Op::Resume
             | Op::EvalBreaker
+            | Op::Expect(_)
+            | Op::ExpectIs(_)
+            | Op::ExpectCheck(_)
+            | Op::ExpectTypeAttr { .. }
+            | Op::ExpectGetattr { .. }
             | Op::Removed => false,
             Op::Bytecode { opcode, arg } => opcodes::signature(*opcode, *arg, false)
                 .is_some_and(|s| s.outputs.iter().any(|o| matches!(o, opcodes::Out::New))),
@@ -333,13 +365,15 @@ pub struct Pin {
     pub path: Option<PinPath>,
 }
 
-// A global (in the frame's globals, then builtins) and the attributes read
-// from it in turn, each through a module's __dict__: `F.linear` is
-// (F, [linear]). Names are indices into Cfg::names.
+// A global (in the frame's globals, then builtins, or in the dicts
+// Cfg::pins[ns]) and the attributes read from it in turn, each through a
+// module's __dict__: `F.linear` is (F, [linear]). Names are indices into
+// Cfg::names.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PinPath {
     pub global: u32,
     pub attrs: Vec<u32>,
+    pub ns: Option<(u32, u32)>,
 }
 
 // A Python value an op takes as is.
@@ -404,6 +438,13 @@ pub struct Version {
     pub outputs: Vec<ValueId>,
     // Ordered by `from`.
     pub unwind: Vec<UnwindSegment>,
+    // Whether anything going wrong (a raise, a failed Expect) abandons the
+    // version and runs the block's origin from the start instead, which
+    // gives CPython's exact exception, traceback and locals: for a version
+    // with no effects a second run would repeat (see cfg/optimize.rs). Its
+    // unwind segments are unused, and it runs no eval breaker after calls
+    // (a signal handled there would be lost by the abort).
+    pub restart: bool,
 }
 
 // Where a raising terminator's exception goes: like a segment's Handler, but
@@ -598,6 +639,11 @@ pub struct Cfg {
     pub literals: Vec<Lit>,
     // What Op::Pinned instrs hold and Check::Pinned checks.
     pub pins: Vec<Pin>,
+    // Consts past the code's own (const_reprs): Op::Const(const_reprs.len()
+    // + i) is the object Cfg::pins[const_pins[i]] (code inlined from another
+    // function). Likewise names past the code's own co_names are only
+    // strings here.
+    pub const_pins: Vec<u32>,
     // What Op::Autograd instrs run.
     pub trainings: Vec<Arc<Training>>,
 }
@@ -630,6 +676,8 @@ pub enum Template {
     Out(u32),
     Lit(Lit),
     Tuple(Vec<Template>),
+    // CPython's NULL (an elided LoadMethod's empty self slot).
+    Null,
 }
 
 impl Index<ValueId> for Cfg {
@@ -681,6 +729,7 @@ impl Cfg {
             names,
             literals: vec![],
             pins: vec![],
+            const_pins: vec![],
             trainings: vec![],
         }
     }
@@ -1013,7 +1062,10 @@ impl<'a> Printer<'a> {
             Op::Param(_) => "Param".into(),
             Op::Const(i) => format!(
                 "Const {}",
-                self.cfg.const_reprs.get(*i as usize).map_or("?", |s| s.as_str())
+                match self.cfg.const_reprs.get(*i as usize) {
+                    Some(s) => s.as_str(),
+                    None => self.cfg.const_pins.get(*i as usize - self.cfg.const_reprs.len()).map_or("?", |p| self.pin(*p)),
+                }
             ),
             Op::Project(i) => format!("Project {i}"),
             Op::ToBool => "ToBool".into(),
@@ -1023,6 +1075,7 @@ impl<'a> Printer<'a> {
             Op::StoreLocal { slot } => format!("StoreLocal {}", self.slot(*slot)),
             Op::DeleteLocal { slot } => format!("DeleteLocal {}", self.slot(*slot)),
             Op::LoadGlobal(n) => format!("LoadGlobal {}", self.name(*n)),
+            Op::LoadGlobalIn { name, globals, .. } => format!("LoadGlobalIn {} {}", self.pin(*globals), self.name(*name)),
             Op::LoadAttr(n) => format!("LoadAttr {}", self.name(*n)),
             Op::LoadMethod(n) => format!("LoadMethod {}", self.name(*n)),
             Op::StoreAttr(n) => format!("StoreAttr {}", self.name(*n)),
@@ -1060,6 +1113,11 @@ impl<'a> Printer<'a> {
             Op::Aten { name, kwnames } => format!("Aten {name} kw[{}]", kwnames.join(", ")),
             Op::Lit(i) => format!("Lit {}", self.cfg.literals.get(*i as usize).map_or("?".into(), |l| l.to_string())),
             Op::Pinned(i) => format!("Pinned {}", self.pin(*i)),
+            Op::Expect(b) => format!("Expect {}", if *b { "True" } else { "False" }),
+            Op::ExpectIs(i) => format!("ExpectIs {}", self.pin(*i)),
+            Op::ExpectCheck(c) => format!("ExpectCheck {}", self.check(&[], c)),
+            Op::ExpectTypeAttr { name, pin } => format!("ExpectTypeAttr {} {}", self.name(*name), self.pin(*pin)),
+            Op::ExpectGetattr { name, pin } => format!("ExpectGetattr {} {}", self.name(*name), self.pin(*pin)),
             Op::Autograd(i) => format!("Autograd t{i}"),
             Op::Removed => "Removed".into(),
         }
@@ -1146,40 +1204,41 @@ impl<'a> Printer<'a> {
         if g.checks.is_empty() {
             return String::new();
         }
-        let param = |i: &u32| blk.params.get(*i as usize).map_or("?".into(), |p| self.param_name(*p));
-        let checks: Vec<String> = g
-            .checks
-            .iter()
-            .map(|c| match c {
-                Check::PlainTensor(i) => format!("plain_tensor({})", param(i)),
-                Check::Exact(i, t) => format!("{}({})", format!("{t:?}").to_lowercase(), param(i)),
-                Check::NoTorchFunctionMode => "no_torch_function_mode".into(),
-                Check::GradEnabled(on) => if *on { "grad_enabled" } else { "grad_disabled" }.into(),
-                Check::RequiresGrad(i, on) => format!("{}({})", if *on { "requires_grad" } else { "no_requires_grad" }, param(i)),
-                Check::TensorMeta(i, t) => {
-                    format!(
-                        "tensor({} {} {} {:?} stride {:?})",
-                        param(i),
-                        crate::bindings::ffi::dtype_name(t.dtype),
-                        crate::bindings::ffi::device_name(t.device_type, t.device_index),
-                        t.sizes,
-                        t.strides
-                    )
-                }
-                Check::Value(i, l) => format!("value({} == {l})", param(i)),
-                Check::NoForwardAD => "no_forward_ad".into(),
-                Check::NoSavedTensorHooks => "no_saved_tensor_hooks".into(),
-                Check::Pinned(i) => format!("pinned({})", self.pin(*i)),
-                Check::Is(p, i) => format!("is({}, {})", param(p), self.pin(*i)),
-                Check::Null(p) => format!("null({})", param(p)),
-                Check::Ints(p, tuple, ns) => {
-                    let ns: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
-                    let (l, r) = if *tuple { ("(", if ns.len() == 1 { ",)" } else { ")" }) } else { ("[", "]") };
-                    format!("value({} == {l}{}{r})", param(p), ns.join(", "))
-                }
-            })
-            .collect();
+        let checks: Vec<String> = g.checks.iter().map(|c| self.check(&blk.params, c)).collect();
         format!(" [guard: {}]", checks.join(", "))
+    }
+
+    // A check on `params` (by position; "_" past them: an ExpectCheck's arg).
+    fn check(&self, params: &[ValueId], c: &Check) -> String {
+        let param = |i: &u32| params.get(*i as usize).map_or("_".into(), |p| self.param_name(*p));
+        match c {
+            Check::PlainTensor(i) => format!("plain_tensor({})", param(i)),
+            Check::Exact(i, t) => format!("{}({})", format!("{t:?}").to_lowercase(), param(i)),
+            Check::NoTorchFunctionMode => "no_torch_function_mode".into(),
+            Check::GradEnabled(on) => if *on { "grad_enabled" } else { "grad_disabled" }.into(),
+            Check::RequiresGrad(i, on) => format!("{}({})", if *on { "requires_grad" } else { "no_requires_grad" }, param(i)),
+            Check::TensorMeta(i, t) => {
+                format!(
+                    "tensor({} {} {} {:?} stride {:?})",
+                    param(i),
+                    crate::bindings::ffi::dtype_name(t.dtype),
+                    crate::bindings::ffi::device_name(t.device_type, t.device_index),
+                    t.sizes,
+                    t.strides
+                )
+            }
+            Check::Value(i, l) => format!("value({} == {l})", param(i)),
+            Check::NoForwardAD => "no_forward_ad".into(),
+            Check::NoSavedTensorHooks => "no_saved_tensor_hooks".into(),
+            Check::Pinned(i) => format!("pinned({})", self.pin(*i)),
+            Check::Is(p, i) => format!("is({}, {})", param(p), self.pin(*i)),
+            Check::Null(p) => format!("null({})", param(p)),
+            Check::Ints(p, tuple, ns) => {
+                let ns: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
+                let (l, r) = if *tuple { ("(", if ns.len() == 1 { ",)" } else { ")" }) } else { ("[", "]") };
+                format!("value({} == {l}{}{r})", param(p), ns.join(", "))
+            }
+        }
     }
 
     fn unwind(&self, out: &mut String, blk: &Block, ver: &Version, indent: &str) {
@@ -1215,7 +1274,7 @@ impl<'a> Printer<'a> {
             match blk.versions.as_slice() {
                 // A single unguarded version prints inline, with its outputs
                 // shown as the values they are.
-                [ver] if ver.guard.checks.is_empty() => {
+                [ver] if ver.guard.checks.is_empty() && !ver.restart => {
                     self.body(out, ver, &inner);
                     let vals = |o: OutIdx| self.val(ver.outputs[o as usize]);
                     let _ = writeln!(out, "{inner}{}", self.term(blk, &vals));
@@ -1224,7 +1283,8 @@ impl<'a> Printer<'a> {
                 }
                 versions => {
                     for ver in versions {
-                        let _ = writeln!(out, "{inner}version{}:", self.guard(blk, &ver.guard));
+                        let restart = if ver.restart { " (restarts)" } else { "" };
+                        let _ = writeln!(out, "{inner}version{}{restart}:", self.guard(blk, &ver.guard));
                         self.body(out, ver, &deeper);
                         let _ = writeln!(out, "{deeper}outputs [{}]", self.vals(&ver.outputs));
                         self.unwind(out, blk, ver, &deeper);

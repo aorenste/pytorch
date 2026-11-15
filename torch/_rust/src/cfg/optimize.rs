@@ -40,10 +40,12 @@ use super::ir::{
     Block, BlockId, Builtin, Cfg, Check, Edge, Exit, Handler, NULL, Op, ParamKind, Pin, PinPath, TermUnwind, Terminator,
     UnwindSegment, ValueId, Version,
 };
+use super::inline::{self, Inlinee};
 use super::outline::{self, Outline};
 
 // What the caller observed about an operator it may replace: the one aten op
 // every visit ran, with the operator's args in order, and what each arg was.
+#[derive(Clone)]
 pub struct AtenOp {
     pub name: String,
     pub args: Vec<Arg>,
@@ -52,9 +54,13 @@ pub struct AtenOp {
 // What the caller observed about a call whose callee may be pinned: the
 // callee's name, and the call's args after the callable if it always returned
 // a plain tensor (each None if it wasn't a plain tensor or builtin scalar).
+#[derive(Clone)]
 pub struct PinnedCall {
     pub name: String,
     pub args: Option<Vec<Option<Arg>>>,
+    // Whether the callee is torch._C._has_torch_function{,_unary,_variadic}:
+    // False for plain tensors when no torch function mode is active.
+    pub has_torch_function: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,6 +70,7 @@ pub enum Arg {
 }
 
 // What the caller observed running the Cfg that the optimizer relies on.
+#[derive(Clone, Default)]
 pub struct Observed {
     // The instrs that may sit in a pure block.
     pub movable: HashSet<ValueId>,
@@ -84,9 +91,12 @@ pub fn optimize_blocks(
     cfg: &mut Cfg,
     blocks: &[BlockId],
     obs: &Observed,
+    inlines: &HashMap<ValueId, Inlinee>,
     pinned: &mut Vec<ValueId>,
+    elided: &mut Vec<(usize, ValueId, ValueId)>,
     strict: bool,
 ) -> Result<Vec<Option<BlockId>>, String> {
+    let mut obs = obs.clone();
     let mut pure = vec![];
     // Each pure block param, and the value it stands for (what was observed).
     let mut stands_for = HashMap::new();
@@ -109,9 +119,18 @@ pub fn optimize_blocks(
     for p in pure {
         let p = map[p.idx()].expect("a pure block is reachable");
         outline::outline(cfg, &[p], Outline::Merge);
+        let calls: Vec<ValueId> = cfg[p].versions[0].body.iter().copied().filter(|v| inlines.contains_key(v)).collect();
+        for v in calls {
+            if let Some(m) = inline::elide(cfg, p, v, &inlines[&v], &mut obs) {
+                elided.extend(m);
+            }
+        }
         let is_null = |v: ValueId| v == NULL || obs.nulls.contains(stands_for.get(&v).unwrap_or(&v));
         pin_calls(cfg, p, &obs.calls, &is_null, pinned);
         use_aten(cfg, p, &obs.aten, &obs.calls);
+        if cfg[p].versions[0].restart {
+            inline::tidy(cfg, p);
+        }
     }
     Ok(map)
 }
@@ -128,7 +147,8 @@ fn load_path(cfg: &Cfg, body: &HashSet<ValueId>, v: ValueId) -> Option<PinPath> 
         return None;
     }
     match cfg[v].op {
-        Op::LoadGlobal(n) => Some(PinPath { global: n, attrs: vec![] }),
+        Op::LoadGlobal(n) => Some(PinPath { global: n, attrs: vec![], ns: None }),
+        Op::LoadGlobalIn { name, globals, builtins } => Some(PinPath { global: name, attrs: vec![], ns: Some((globals, builtins)) }),
         Op::LoadAttr(n) if plain_name(cfg, n) => {
             let mut p = load_path(cfg, body, cfg[v].args[0])?;
             p.attrs.push(n);
@@ -248,7 +268,7 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
     for x in chain {
         let unused = |x: &ValueId| used.get(x).copied().unwrap_or(0) == 0;
         let removable = match cfg[x].op {
-            Op::LoadGlobal(_) | Op::LoadAttr(_) | Op::Project(_) => unused(&x),
+            Op::LoadGlobal(_) | Op::LoadGlobalIn { .. } | Op::LoadAttr(_) | Op::Project(_) => unused(&x),
             // Its projects (the NULL and the pinned callee) are its outputs.
             Op::LoadMethod(_) => body.iter().all(|y| dead.contains(y) || !(matches!(cfg[*y].op, Op::Project(_)) && cfg[*y].args[0] == x)),
             _ => false,
@@ -279,10 +299,30 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
 fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &HashMap<ValueId, PinnedCall>) {
     let params = cfg[p].params.clone();
     let body = cfg[p].versions[0].body.clone();
+    let restart = cfg[p].versions[0].restart;
     let mut checks: BTreeSet<Check> = BTreeSet::new();
+    // Values read in the version (a version that restarts can check them
+    // where they're read), and the checks they need.
+    let mut read_checks: BTreeSet<(ValueId, Check)> = BTreeSet::new();
+    let is_read = |cfg: &Cfg, x: ValueId| restart && !matches!(cfg[x].op, Op::Param(_) | Op::Const(_) | Op::Pinned(_) | Op::Lit(_)) && inline::is_read(cfg, x);
     // Results of replaced ops: plain tensors whenever the guard holds.
     let mut tensors: HashSet<ValueId> = HashSet::new();
+    // has_torch_function calls of plain tensors, which are False.
+    let mut falses = vec![];
     for v in body {
+        if let Some(PinnedCall { has_torch_function: true, .. }) = calls.get(&v) {
+            let a = cfg[v].args.clone();
+            let plain = |x: &ValueId| tensors.contains(x) || params.contains(x);
+            if a.len() > 2 && a[0] == NULL && matches!(cfg[a[1]].op, Op::Pinned(_)) && a[2..].iter().all(plain) {
+                for x in &a[2..] {
+                    if let Some(i) = params.iter().position(|q| q == x) {
+                        checks.insert(Check::PlainTensor(i as u32));
+                    }
+                }
+                falses.push(v);
+            }
+            continue;
+        }
         let pinned_call = matches!(cfg[v].op, Op::Call { .. }) && cfg[v].args.get(1).is_some_and(|c| matches!(cfg[*c].op, Op::Pinned(_)));
         let (args, kinds): (Vec<ValueId>, Vec<Option<Arg>>) = match (aten.get(&v), calls.get(&v)) {
             (Some(a), _) => (cfg[v].args.clone(), a.args.iter().copied().map(Some).collect()),
@@ -293,7 +333,15 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
             continue;
         }
         let mut need = vec![];
+        let mut need_read = vec![];
         let ok = args.iter().zip(&kinds).all(|(x, kind)| match (params.iter().position(|q| q == x), kind) {
+            (None, Some(kind)) if is_read(cfg, *x) && !tensors.contains(x) => {
+                need_read.push((*x, match kind {
+                    Arg::PlainTensor => Check::PlainTensor(0),
+                    Arg::Scalar(t) => Check::Exact(0, *t),
+                }));
+                true
+            }
             (Some(i), Some(kind)) => {
                 need.push(match kind {
                     Arg::PlainTensor => Check::PlainTensor(i as u32),
@@ -303,19 +351,43 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
             }
             (Some(_), None) => false,
             (None, Some(Arg::PlainTensor)) => tensors.contains(x),
+            // A pinned object is fixed too (an elided call's default).
+            (None, Some(Arg::Scalar(_))) => matches!(cfg[*x].op, Op::Const(_) | Op::Pinned(_)),
             (None, _) => matches!(cfg[*x].op, Op::Const(_)),
         });
         if ok {
             checks.extend(need);
+            read_checks.extend(need_read);
             if !pinned_call {
                 cfg[v].op = Op::Aten { name: aten[&v].name.clone(), kwnames: vec![] };
             }
             tensors.insert(v);
         }
     }
-    if !tensors.is_empty() {
+    if !tensors.is_empty() || !falses.is_empty() {
         checks.insert(Check::NoTorchFunctionMode);
         cfg[p].versions[0].guard.checks.extend(checks);
+    }
+    if !falses.is_empty() {
+        cfg.literals.push(super::ir::Lit::Bool(false));
+        let k = cfg.literals.len() as u32 - 1;
+        for v in falses {
+            cfg[v].op = Op::Lit(k);
+            cfg[v].args.clear();
+        }
+    }
+    // Each read's checks right after it.
+    if !read_checks.is_empty() {
+        let body = std::mem::take(&mut cfg[p].versions[0].body);
+        let mut out = vec![];
+        for v in body {
+            out.push(v);
+            for (_, c) in read_checks.iter().filter(|(x, _)| *x == v) {
+                let origin = cfg[v].origin;
+                out.push(cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![v], origin));
+            }
+        }
+        cfg[p].versions[0].body = out;
     }
 }
 

@@ -2,6 +2,7 @@
 // in the frame (localsplus); SSA values are owned references in `vals`.
 
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 use pyo3::ffi::{self, PyObject};
 
@@ -18,6 +19,9 @@ use super::{Compiled, Prepared};
 enum Exc {
     Error,
     Reraise,
+    // An Expect failed (no exception is set): only in a version that
+    // restarts.
+    Abort,
 }
 
 type R = Result<(), Exc>;
@@ -77,12 +81,15 @@ unsafe fn new_bool(b: bool) -> *mut PyObject {
 }
 
 struct Act<'a> {
+    // None when running a graph (outside any frame).
+    c: Option<&'a Compiled>,
     p: &'a Prepared,
     cfg: &'a Cfg,
     f: *mut Frame,
     locals: *mut *mut PyObject,
-    consts: *mut PyObject,
-    names: *mut PyObject,
+    // By index: Prepared::consts and Prepared::names (borrowed).
+    consts: *const *mut PyObject,
+    names: *const *mut PyObject,
     vals: Vec<*mut PyObject>,
     tstate: *mut ffi::PyThreadState,
     // The activation's recorder (null when not recording, see recording()),
@@ -236,15 +243,20 @@ enum Next {
     // A raise went to this handler (entered).
     Block(BlockId),
     Done(Outcome),
+    // A version that restarts was abandoned (its values released, no
+    // exception set): run the block's origin.
+    Restart,
 }
 
 pub const FLAG_RAISE: u8 = 1;
+// In a version that restarts (see Version::restart).
+pub const FLAG_RESTART: u8 = 1 << 6;
 // Its own id holds a value (not a multi-output instr's), observed when it's
 // defined.
 pub const FLAG_VALUE: u8 = 2;
 // A call whose callable is args[0] (or args[1] when args[0] is NULL).
 pub const FLAG_CALL: u8 = 4;
-// CALL_FUNCTION_EX, whose callable is args[1].
+// CALL_FUNCTION_EX, whose callable is args[0] (its NULL slot isn't an arg).
 pub const FLAG_CALL_EX: u8 = 8;
 pub const FLAG_YIELD: u8 = 16;
 
@@ -267,12 +279,13 @@ pub unsafe fn run(c: &Compiled, prep: &Prepared, f: *mut Frame, start: Start) ->
     recording(prep, site, |rec| {
         let Bufs { vals, args, outs, edge } = Bufs::take(prep.cfg.instrs.len());
         let mut act = Act {
+            c: Some(c),
             p: prep,
             cfg: &prep.cfg,
             f,
             locals: tr_frame_localsplus(f),
-            consts: c.consts.as_ptr(),
-            names: c.names.as_ptr(),
+            consts: prep.consts.0.as_ptr(),
+            names: prep.names.0.as_ptr(),
             vals,
             tstate: ffi::PyThreadState_Get(),
             scope_rec: rec,
@@ -303,12 +316,13 @@ pub unsafe fn run_graph(prep: &Prepared, inputs: &[*mut PyObject]) -> Result<Vec
     let Bufs { vals, args, outs, edge } = Bufs::take(prep.cfg.instrs.len());
     let mut dummy: *mut u16 = std::ptr::null_mut();
     let mut act = Act {
+        c: None,
         p: prep,
         cfg: &prep.cfg,
         f: std::ptr::null_mut(),
         locals: std::ptr::null_mut(),
-        consts: std::ptr::null_mut(),
-        names: std::ptr::null_mut(),
+        consts: std::ptr::null(),
+        names: std::ptr::null(),
         vals,
         tstate: ffi::PyThreadState_Get(),
         scope_rec: std::ptr::null_mut(),
@@ -425,11 +439,11 @@ impl Act<'_> {
     }
 
     unsafe fn name(&self, i: u32) -> *mut PyObject {
-        ffi::PyTuple_GET_ITEM(self.names, i as ffi::Py_ssize_t)
+        *self.names.add(i as usize)
     }
 
     unsafe fn konst(&self, i: u32) -> *mut PyObject {
-        ffi::PyTuple_GET_ITEM(self.consts, i as ffi::Py_ssize_t)
+        *self.consts.add(i as usize)
     }
 
     // Moves the outputs of a multi-output instr into its Project instrs.
@@ -509,12 +523,21 @@ impl Act<'_> {
         } else {
             vers.iter().position(|v| v.guard.checks.iter().all(|c| self.check(b, c)))?
         };
-        self.drop_all(&self.p.live.versions[b.idx()][ver].entry_kill);
+        // A version that restarts may run its origin on all the params, so
+        // it keeps them (see run_blocks).
+        if !vers[ver].restart {
+            self.drop_all(&self.p.live.versions[b.idx()][ver].entry_kill);
+        }
         Some(ver)
     }
 
     unsafe fn check(&self, b: BlockId, c: &Check) -> bool {
-        let param = |i: &u32| self.val(self.cfg[b].params[*i as usize]);
+        self.check_on(c, |i| self.val(self.cfg[b].params[i as usize]))
+    }
+
+    // `c` with `param(i)` as its params' values.
+    unsafe fn check_on(&self, c: &Check, param: impl Fn(u32) -> *mut PyObject) -> bool {
+        let param = |i: &u32| param(*i);
         let tensor = |o: *mut PyObject| tffi::tensor_by_type(o as usize).as_ref();
         match c {
             Check::PlainTensor(i) => super::is_plain_tensor(param(i)),
@@ -551,9 +574,13 @@ impl Act<'_> {
             Check::NoSavedTensorHooks => !tffi::saved_tensor_hooks_active(),
             Check::Pinned(k) => match &self.cfg.pins[*k as usize].path {
                 Some(path) => {
-                    !self.f.is_null()
-                        && tr_resolve_pin(self.f, path.global as c_int, path.attrs.as_ptr(), path.attrs.len() as isize)
-                            == self.p.pins[*k as usize].as_ptr()
+                    let (globals, builtins) = match path.ns {
+                        Some((g, b)) => (self.p.pins[g as usize].as_ptr(), self.p.pins[b as usize].as_ptr()),
+                        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+                    };
+                    let names: Vec<*mut PyObject> = std::iter::once(path.global).chain(path.attrs.iter().copied()).map(|n| self.name(n)).collect();
+                    (!self.f.is_null() || !globals.is_null())
+                        && tr_resolve_pin(self.f, globals, builtins, names.as_ptr(), names.len() as isize) == self.p.pins[*k as usize].as_ptr()
                 }
                 None => false,
             },
@@ -584,8 +611,12 @@ impl Act<'_> {
 
     // Runs b's origin with its own autograd node (see autograd.rs).
     unsafe fn bootstrap(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
+        let k = crate::cfg::partition::prefix_len(self.cfg, &self.cfg[b].versions[0]);
+        if k > 0 {
+            return self.bootstrap_prefix(b, k);
+        }
         let params = self.take_params(b);
-        let at = super::autograd::Where { code: tr_frame_code(self.f), prep: self.p as *const Prepared as usize, block: b };
+        let at = super::autograd::Where { compiled: super::shared(self.c.expect("a frame's Act")), prep: self.p as *const Prepared as usize, block: b };
         // Params passed through as they are: those the guard pins down (a
         // NULL, a pinned callee) and those no op reads (only carried along).
         let blk = &self.cfg[b];
@@ -627,14 +658,110 @@ impl Act<'_> {
         self.after_origin(b, result)
     }
 
+    // Bootstraps block b, whose version has a read prefix of k instrs: runs
+    // the prefix, then (outside the executor, under the tracer) the rest of
+    // the version on the params and the prefix's values, which the node's
+    // edges then go to, instead of the origin (which would read them again).
+    // Anything going wrong runs the origin, as the version would.
+    unsafe fn bootstrap_prefix(&mut self, b: BlockId, k: usize) -> Result<BlockId, Outcome> {
+        let cfg = self.cfg;
+        let blk = &cfg[b];
+        let ver = &blk.versions[0];
+        let saved: Vec<*mut PyObject> = blk.params.iter().map(|p| xincref(self.val(*p))).collect();
+        let rerun = |this: &mut Self, saved: Vec<*mut PyObject>| {
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            this.clear(b, 0);
+            let result = this.run_origin(b, saved);
+            this.after_origin(b, result)
+        };
+        for v in &ver.body[..k] {
+            if self.exec(*v, &cfg[*v]).is_err() {
+                return rerun(self, saved);
+            }
+        }
+        let carried = crate::cfg::partition::carried(cfg, ver, k);
+        let ids: Vec<ValueId> = blk.params.iter().chain(&carried).copied().collect();
+        let args: Vec<*mut PyObject> = ids.iter().map(|x| self.val(*x)).collect();
+        let needs = args.iter().any(|o| !o.is_null() && tffi::tensor_by_type(*o as usize).as_ref().is_some_and(|t| t.requires_grad()));
+        // Run the rest; Leave with the outputs, or Error.
+        let run_rest = |this: &mut Self| {
+            for v in &ver.body[k..] {
+                if this.exec(*v, &cfg[*v]).is_err() {
+                    return Outcome::Error;
+                }
+            }
+            Outcome::Leave(ver.outputs.iter().map(|o| xincref(this.val(*o))).collect())
+        };
+        let result = if needs {
+            // Passed through as they are: what the guard pins down, what
+            // only the prefix reads (or only becomes an output), and pinned
+            // objects and constants.
+            let compute_reads = |q: ValueId| ver.body[k..].iter().any(|v| cfg[*v].args.contains(&q));
+            let pinned: Vec<bool> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    let i = i as u32;
+                    ver.guard.checks.iter().any(|c| matches!(c, Check::Null(j) | Check::Is(j, _) if *j == i))
+                        || !compute_reads(*x)
+                        || matches!(cfg[*x].op, Op::Pinned(_) | Op::Const(_) | Op::Lit(_))
+                })
+                .collect();
+            let at = super::autograd::Where { compiled: super::shared(self.c.expect("a frame's Act")), prep: self.p as *const Prepared as usize, block: b };
+            match super::outside_executor(|| super::autograd::Bootstrap::start(&args, &pinned, at)) {
+                Ok(None) => match run_rest(self) {
+                    Outcome::Error => return rerun(self, saved),
+                    r => r,
+                },
+                Ok(Some((boot, call))) => {
+                    for (x, obj) in ids.iter().zip(call) {
+                        let old = std::mem::replace(&mut self.vals[x.idx()], obj);
+                        ffi::Py_XDECREF(old);
+                    }
+                    let result = super::outside_executor(|| run_rest(self));
+                    match super::outside_executor(|| boot.finish(result)) {
+                        // As in bootstrap: stop bootstrapping b, and run it
+                        // as usual.
+                        Outcome::Error => {
+                            let py = pyo3::Python::assume_attached();
+                            let why = pyo3::PyErr::take(py).map_or("?".into(), |e| e.to_string());
+                            self.p.autograd[b.idx()].store(false, std::sync::atomic::Ordering::Relaxed);
+                            *self.p.autograd_why[b.idx()].get() = Some(format!("the traced run raised {why}"));
+                            return rerun(self, saved);
+                        }
+                        r => r,
+                    }
+                }
+                Err(e) => {
+                    e.restore(pyo3::Python::assume_attached());
+                    Outcome::Error
+                }
+            }
+        } else {
+            match run_rest(self) {
+                Outcome::Error => return rerun(self, saved),
+                r => r,
+            }
+        };
+        for p in saved {
+            ffi::Py_XDECREF(p);
+        }
+        self.clear(b, 0);
+        self.after_origin(b, result)
+    }
+
     // Whether b's block may bootstrap now: its version's guard holds, grad
-    // mode is on and a tensor param requires grad.
+    // mode is on and a tensor param requires grad (or, with a read prefix,
+    // grad mode is on: what the prefix reads is only known after it runs).
     unsafe fn wants_autograd(&self, b: BlockId) -> bool {
         let blk = &self.cfg[b];
         super::autograd::enabled()
             && tffi::grad_mode_enabled()
             && blk.versions[0].guard.checks.iter().all(|c| self.check(b, c))
-            && blk.params.iter().any(|p| tffi::tensor_by_type(self.val(*p) as usize).as_ref().is_some_and(|t| t.requires_grad()))
+            && (crate::cfg::partition::prefix_len(self.cfg, &blk.versions[0]) > 0
+                || blk.params.iter().any(|p| tffi::tensor_by_type(self.val(*p) as usize).as_ref().is_some_and(|t| t.requires_grad())))
     }
 
     unsafe fn take_params(&mut self, b: BlockId) -> Vec<*mut PyObject> {
@@ -647,6 +774,7 @@ impl Act<'_> {
         recording(origin, Site::Block(ENTRY), |rec| {
             let Bufs { vals, args, outs, edge } = Bufs::take(origin.cfg.instrs.len());
             let mut sub = Act {
+                c: self.c,
                 p: origin,
                 cfg: &origin.cfg,
                 vals,
@@ -873,6 +1001,13 @@ impl Act<'_> {
             };
             let ver = &blk.versions[vi];
             let code = &self.p.code[b.idx()][vi];
+            // What its origin runs on if a version that restarts is
+            // abandoned.
+            let mut restart_params: Option<Vec<*mut PyObject>> =
+                (ver.restart && first == 0).then(|| blk.params.iter().map(|p| xincref(self.val(*p))).collect());
+            if restart_params.is_some() {
+                self.drop_all(&self.p.live.versions[b.idx()][vi].entry_kill);
+            }
             let fast = self.rec.is_null();
             let mut i = first;
             while i < code.steps.len() {
@@ -914,7 +1049,22 @@ impl Act<'_> {
                         continue 'blocks;
                     }
                     Next::Done(outcome) => return outcome,
+                    Next::Restart => {
+                        self.p.aborts[b.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let params = restart_params.take().expect("a version that restarts kept its params");
+                        let result = self.run_origin(b, params);
+                        match self.after_origin(b, result) {
+                            Ok(next) => {
+                                b = next;
+                                continue 'blocks;
+                            }
+                            Err(outcome) => return outcome,
+                        }
+                    }
                 }
+            }
+            for p in restart_params.take().into_iter().flatten() {
+                ffi::Py_XDECREF(p);
             }
             let edge = match &blk.term {
                 Terminator::Jump(_) => code.edges[0].as_ref(),
@@ -964,24 +1114,52 @@ impl Act<'_> {
             let c = self.val(ins.args[0]);
             Some(if c.is_null() { self.val(ins.args[1]) } else { c })
         } else if flags & FLAG_CALL_EX != 0 {
-            Some(self.val(ins.args[1]))
+            Some(self.val(ins.args[0]))
         } else {
             None
         };
         let rec = self.rec;
         if !rec.is_null() {
-            if let Some(c) = callee.filter(|c| !c.is_null()) {
-                effects::record_callee(&self.p.callees, *v, c);
+            // The function a frame entered for the instr would run directly:
+            // the callable's, or the one its (or the receiver's) class runs.
+            let direct = match (callee, &ins.op) {
+                (Some(c), _) if !c.is_null() => {
+                    let via_type = tr_type_function(c, 0);
+                    Some(if via_type.is_null() { (c, effects::Via::Callable) } else { (via_type, effects::Via::Call) })
+                }
+                (None, Op::LoadAttr(_) | Op::LoadMethod(_)) => {
+                    let f = tr_type_function(self.val(ins.args[0]), 1);
+                    (!f.is_null()).then_some((f, effects::Via::Getattr))
+                }
+                _ => None,
+            };
+            if let Some((f, via)) = direct {
+                effects::record_callee(&self.p.callees, *v, f, via);
             }
             (*rec).at(Site::Instr(*v));
-            (*rec).set_callee(callee.unwrap_or(std::ptr::null_mut()));
+            (*rec).set_callee(direct.map_or(std::ptr::null_mut(), |(f, _)| f));
+        }
+        let clone = if self.p.clones.is_empty() { None } else { self.p.clones.get(v) };
+        if let Some(cl) = clone {
+            super::NEXT_CLONE.set((cl.code.as_ptr() as usize, self.f as usize, Arc::as_ptr(&cl.compiled) as usize));
         }
         let done = self.exec(*v, ins);
+        if clone.is_some() {
+            super::NEXT_CLONE.set((0, 0, 0));
+        }
         if !rec.is_null() {
             (*rec).set_callee(std::ptr::null_mut());
             (*rec).at(Site::Block(b));
         }
-        if let Err(how) = done.and_then(|()| if callee.is_some() { self.breaker() } else { Ok(()) }) {
+        let restart = flags & FLAG_RESTART != 0;
+        if let Err(how) = done.and_then(|()| if callee.is_some() && !restart { self.breaker() } else { Ok(()) }) {
+            if restart {
+                if how != Exc::Abort {
+                    ffi::PyErr_Clear();
+                }
+                self.clear(b, vi);
+                return Next::Restart;
+            }
             return match self.unwind(b, vi, i, how) {
                 Unwound::Block(h) => Next::Block(h),
                 Unwound::Outer(k, args) => Next::Done(Outcome::Outer(k, args)),
@@ -1038,10 +1216,24 @@ impl Act<'_> {
                 let cache = self.p.globals[self.p.global_slot[v.idx()] as usize].get();
                 check(tr_load_global(self.f, *n as c_int, cache))?
             }
+            Op::LoadGlobalIn { name, globals, builtins } => {
+                let name = self.name(*name);
+                let mut x = ffi::PyDict_GetItemWithError(self.p.pins[*globals as usize].as_ptr(), name);
+                if x.is_null() && ffi::PyErr_Occurred().is_null() {
+                    x = ffi::PyDict_GetItemWithError(self.p.pins[*builtins as usize].as_ptr(), name);
+                }
+                if x.is_null() {
+                    if ffi::PyErr_Occurred().is_null() {
+                        ffi::PyErr_Format(ffi::PyExc_NameError, c"name '%U' is not defined".as_ptr(), name);
+                    }
+                    return Err(Exc::Error);
+                }
+                xincref(x)
+            }
             Op::LoadAttr(n) => check(ffi::PyObject_GetAttr(a(0), self.name(*n)))?,
             Op::LoadMethod(n) => {
                 let mut out = [std::ptr::null_mut(); 2];
-                status(tr_load_method(self.f, *n as c_int, a(0), out.as_mut_ptr()))?;
+                status(tr_load_method(self.name(*n), a(0), out.as_mut_ptr()))?;
                 self.distribute(v, &out);
                 return Ok(());
             }
@@ -1081,6 +1273,22 @@ impl Act<'_> {
             }
             Op::Lit(i) => xincref(self.p.literals[*i as usize].as_ptr()),
             Op::Pinned(i) => xincref(self.p.pins[*i as usize].as_ptr()),
+            Op::Expect(want) => {
+                return if (a(0) == ffi::Py_True()) == *want { Ok(()) } else { Err(Exc::Abort) };
+            }
+            Op::ExpectIs(i) => {
+                return if a(0) == self.p.pins[*i as usize].as_ptr() { Ok(()) } else { Err(Exc::Abort) };
+            }
+            Op::ExpectTypeAttr { name, pin } => {
+                return if tr_type_attr_is(a(0), self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0 { Ok(()) } else { Err(Exc::Abort) };
+            }
+            Op::ExpectGetattr { name, pin } => {
+                return if tr_getattr_falls_back(a(0), self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0 { Ok(()) } else { Err(Exc::Abort) };
+            }
+            Op::ExpectCheck(c) => {
+                let x = a(0);
+                return if self.check_on(c, |_| x) { Ok(()) } else { Err(Exc::Abort) };
+            }
             Op::Autograd(t) => {
                 let params: Vec<*mut PyObject> = ins.args.iter().map(|a| self.val(*a)).collect();
                 match super::autograd::forward(&self.p.trainings[*t as usize], &params) {

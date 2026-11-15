@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::cfg::ir::{Annotations, BlockId, Cfg, Check, Lit, Op, Site, TensorSpec, Training, ValueId};
+use crate::cfg::ir::{Annotations, BlockId, Cfg, Check, Exit, Lit, Op, Site, TensorSpec, Terminator, Training, ValueId};
 use crate::cfg::opcodes::{self, Out};
 use crate::cfg::outline::Outline;
 
@@ -34,6 +34,30 @@ static PREV_EVAL_FRAME: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ACTIVE: Cell<usize> = const { Cell::new(0) };
+    // Set around an instr that has a clone (see Prepared::clones): (code,
+    // calling frame, Compiled). The frame the instr enters for that code,
+    // called from that frame, runs the clone; taken by the first match.
+    pub(crate) static NEXT_CLONE: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+}
+
+thread_local! {
+    // Why the last elision attempt was refused (see TORCH_RUST_ELIDE_DEBUG).
+    static ELIDE_WHY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn why(s: String) {
+    ELIDE_WHY.set(Some(s));
+}
+
+// How deep clones nest (a clone's instrs get clones of their own).
+const MAX_CLONE_DEPTH: u32 = 16;
+
+// A copy of a callee's Compiled that only frames entered from one site run,
+// so its observations are that site's (see Prepared::clones).
+pub struct SiteClone {
+    // Held so that the address the hand-off compares can't be reused.
+    pub code: Py<PyAny>,
+    pub compiled: Arc<Compiled>,
 }
 
 // Runs f with no executor active on this thread: frames it runs are left to
@@ -55,6 +79,11 @@ const CO_COROUTINE: u32 = 0x80;
 const CO_ITERABLE_COROUTINE: u32 = 0x100;
 const CO_ASYNC_GENERATOR: u32 = 0x200;
 const GENERATOR_FLAGS: u32 = CO_GENERATOR | CO_COROUTINE | CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR;
+
+// Objects something else keeps alive, only touched with the GIL held.
+pub struct Borrowed(pub Vec<*mut pyo3::ffi::PyObject>);
+unsafe impl Send for Borrowed {}
+unsafe impl Sync for Borrowed {}
 
 // A Cfg with what the executor precomputes for it, and the same for the
 // origins of its blocks.
@@ -85,8 +114,10 @@ pub struct Prepared {
     pub aten: HashMap<ValueId, (Py<PyAny>, Option<Py<PyTuple>>)>,
     // Cfg::literals as Python objects.
     pub literals: Vec<Py<PyAny>>,
-    // By block: how many times no version's guard held (see _cfg_misses).
+    // By block: how many times no version's guard held (see _cfg_misses),
+    // and how many times a version that restarts was abandoned.
     pub misses: Box<[AtomicU32]>,
+    pub aborts: Box<[AtomicU32]>,
     // By block: whether it may get its own autograd node (see autograd.rs);
     // cleared when it can't, with why.
     pub autograd: Box<[AtomicBool]>,
@@ -100,6 +131,18 @@ pub struct Prepared {
     pub record: bool,
     // What each of Cfg::pins was pinned to.
     pub pins: Vec<Py<PyAny>>,
+    // What Op::Const and name indices refer to: the code's co_consts and
+    // co_names, then the Cfg's own (see Cfg::const_pins), borrowed from the
+    // Compiled, `pins` and `extra_names`. Empty for an origin (it uses its
+    // owner's).
+    pub consts: Borrowed,
+    pub names: Borrowed,
+    pub extra_names: Vec<Py<PyAny>>,
+    // By instr (a call, or an attribute load whose class runs __getattr__):
+    // the clone the callee's frame runs when entered from it. Made when the
+    // code is optimized, for Python functions every visit entered directly,
+    // and carried over to later Plans.
+    pub clones: HashMap<ValueId, SiteClone>,
 }
 
 impl Prepared {
@@ -136,6 +179,9 @@ impl Prepared {
                 } => run::FLAG_CALL_EX,
                 _ => 0,
             } | if ins.op.can_raise() { run::FLAG_RAISE } else { 0 };
+        }
+        for v in cfg.blocks.iter().flat_map(|b| &b.versions).filter(|ver| ver.restart).flat_map(|ver| &ver.body) {
+            flags[v.idx()] |= run::FLAG_RESTART;
         }
         // A multi-output instr's values are its Projects'.
         for v in body() {
@@ -218,12 +264,17 @@ impl Prepared {
             aten,
             literals,
             misses: (0..cfg_blocks).map(|_| AtomicU32::new(0)).collect(),
+            aborts: (0..cfg_blocks).map(|_| AtomicU32::new(0)).collect(),
             autograd,
             autograd_why: (0..cfg_blocks).map(|_| ffi::GilCell::new(None)).collect(),
             trainings,
             record: true,
             // The pins the previous Cfg already had (pins are only added).
             pins: Python::attach(|py| prev.map_or(vec![], |p| p.pins.iter().map(|o| o.clone_ref(py)).collect())),
+            clones: HashMap::new(),
+            consts: Borrowed(vec![]),
+            names: Borrowed(vec![]),
+            extra_names: vec![],
         })
     }
 
@@ -292,7 +343,8 @@ pub struct Plan {
 }
 
 impl Plan {
-    fn new(cfg: Cfg, prev: Option<&Plan>, record: bool, pins: Vec<Py<PyAny>>) -> PyResult<Self> {
+    // `consts` and `names`: the code's co_consts and co_names.
+    fn new(cfg: Cfg, prev: Option<&Plan>, record: bool, pins: Vec<Py<PyAny>>, consts: &Py<PyTuple>, names: &Py<PyTuple>) -> PyResult<Self> {
         let mut resume = HashMap::new();
         let bodies = cfg.block_ids().flat_map(|b| cfg[b].versions.iter().enumerate().map(move |(vi, ver)| (b, vi, ver)));
         for (b, vi, ver) in bodies {
@@ -319,6 +371,17 @@ impl Plan {
         if prep.pins.len() != prep.cfg.pins.len() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("CFG executor: a pin has no object"));
         }
+        Python::attach(|py| -> PyResult<()> {
+            let (consts, names) = (consts.bind(py), names.bind(py));
+            prep.consts.0 = consts.iter().map(|o| o.as_ptr()).collect();
+            prep.consts.0.extend(prep.cfg.const_pins.iter().map(|p| prep.pins[*p as usize].as_ptr()));
+            for n in &prep.cfg.names[names.len()..] {
+                prep.extra_names.push(pyo3::types::PyString::intern(py, n).into_any().unbind());
+            }
+            prep.names.0 = names.iter().map(|o| o.as_ptr()).collect();
+            prep.names.0.extend(prep.extra_names.iter().map(|o| o.as_ptr()));
+            Ok(())
+        })?;
         Ok(Plan { resume, prep })
     }
 }
@@ -332,8 +395,12 @@ pub struct Compiled {
     // Boxed so a Plan doesn't move when the Vec grows.
     #[allow(clippy::vec_box)]
     plans: Mutex<Vec<Box<Plan>>>,
-    // Whether the code was optimized after its first run (see OPTIMIZE).
+    // Whether the code was optimized after its first run (see OPTIMIZE), and
+    // how many times its frames returned since.
     auto_optimized: AtomicBool,
+    returns: AtomicU32,
+    // 0 for a code's own Compiled; one more than its caller's for a clone.
+    pub depth: u32,
     pub flags: u32,
     pub consts: Py<PyTuple>,
     pub names: Py<PyTuple>,
@@ -344,14 +411,18 @@ impl Compiled {
         let info = crate::cfg::python::code_info(code)?;
         let outline = *OUTLINE.lock().unwrap();
         let cfg = crate::cfg::build(info, true, outline).map_err(crate::cfg::python::to_pyerr)?;
-        let mut plan = Box::new(Plan::new(cfg, None, true, vec![])?);
+        let consts = code.getattr("co_consts")?.downcast_into::<PyTuple>()?.unbind();
+        let names = code.getattr("co_names")?.downcast_into::<PyTuple>()?.unbind();
+        let mut plan = Box::new(Plan::new(cfg, None, true, vec![], &consts, &names)?);
         Ok(Compiled {
             plan: AtomicPtr::new(&mut *plan),
             plans: Mutex::new(vec![plan]),
             auto_optimized: AtomicBool::new(false),
+            returns: AtomicU32::new(0),
+            depth: 0,
             flags: code.getattr("co_flags")?.extract()?,
-            consts: code.getattr("co_consts")?.downcast_into::<PyTuple>()?.unbind(),
-            names: code.getattr("co_names")?.downcast_into::<PyTuple>()?.unbind(),
+            consts,
+            names,
         })
     }
 
@@ -370,6 +441,21 @@ static OUTLINE: Mutex<Option<Outline>> = Mutex::new(None);
 pub fn _set_cfg_outline(mode: Option<&str>) -> PyResult<()> {
     *OUTLINE.lock().unwrap() = crate::cfg::python::outline_mode(mode)?;
     Ok(())
+}
+
+// Whether optimizing elides calls whose clones' paths can be copied into the
+// caller (see cfg/inline.rs). With OPTIMIZE, a code with clones is also
+// optimized again (eliding) when its frames have returned ELIDE_AFTER times
+// since its first optimization, enough for clones nested MAX_CLONE_DEPTH
+// deep to have been made and to have observed.
+static ELIDE: AtomicBool = AtomicBool::new(false);
+const ELIDE_AFTER: u32 = 10;
+
+/// Elide calls of Python functions when optimizing, from what their clones
+/// observed (see cfg/inline.rs).
+#[pyfunction]
+pub fn _set_cfg_elide(on: bool) {
+    ELIDE.store(on, Ordering::Relaxed);
 }
 
 // Whether the executor optimizes every block of a code's CFG after the first
@@ -398,9 +484,15 @@ unsafe extern "C" fn free_compiled(p: *mut c_void) {
         // CPython frees code objects without pyo3 knowing the GIL is held, so
         // attach, or the Compiled's objects would only be released the next
         // time pyo3 attaches (as they are if it can't: while finalizing).
-        let c = Box::from_raw(p as *mut Compiled);
+        let c = Arc::from_raw(p as *const Compiled);
         let _ = Python::try_attach(|_| drop(c));
     }
+}
+
+// Every Compiled is held by an Arc: co_extra's, or a caller's (a clone).
+pub(crate) unsafe fn shared(c: &Compiled) -> Arc<Compiled> {
+    Arc::increment_strong_count(c);
+    Arc::from_raw(c)
 }
 
 pub(crate) fn extra_index() -> isize {
@@ -441,9 +533,9 @@ unsafe fn compiled<'a>(code: *mut pyo3::ffi::PyObject) -> Lookup<'a> {
                 if let Some(e) = pending {
                     e.restore(py);
                 }
-                let p = Box::into_raw(Box::new(c));
+                let p = Arc::into_raw(Arc::new(c));
                 if PyUnstable_Code_SetExtra(code, index, p as *mut c_void) < 0 {
-                    drop(Box::from_raw(p));
+                    drop(Arc::from_raw(p));
                     return Lookup::Error;
                 }
                 Lookup::Compiled(&*p)
@@ -474,10 +566,16 @@ unsafe extern "C" fn eval_frame(
     // the generator object, and we continue from where it was suspended.
     let gen_frame = tr_frame_owned_by_generator(frame) != 0;
     let code = tr_frame_code(frame);
-    let compiled = match compiled(code) {
-        Lookup::Compiled(c) => Some(c),
-        Lookup::Trampoline => return prev(tstate, frame, throwflag),
-        Lookup::Error => None,
+    let pending = NEXT_CLONE.get();
+    let compiled = if !gen_frame && pending.2 != 0 && pending.0 == code as usize && tr_current_frame(tstate) as usize == pending.1 {
+        NEXT_CLONE.set((0, 0, 0));
+        Some(&*(pending.2 as *const Compiled))
+    } else {
+        match compiled(code) {
+            Lookup::Compiled(c) => Some(c),
+            Lookup::Trampoline => return prev(tstate, frame, throwflag),
+            Lookup::Error => None,
+        }
     };
     effects::frame_entered(frame, gen_frame);
     if !gen_frame {
@@ -519,14 +617,21 @@ unsafe extern "C" fn eval_frame(
         run::Start::Entry
     };
     let outcome = run::run(c, &plan.prep, frame, start);
-    if matches!(outcome, run::Outcome::Return(_))
-        && OPTIMIZE.load(Ordering::Relaxed)
-        && !OPTIMIZING.get()
-        && !c.auto_optimized.swap(true, Ordering::Relaxed)
-    {
+    if matches!(outcome, run::Outcome::Return(_)) && OPTIMIZE.load(Ordering::Relaxed) && !OPTIMIZING.get() {
         let py = Python::assume_attached();
-        if let Err(e) = optimize(py, c, None) {
-            e.write_unraisable(py, None);
+        if !c.auto_optimized.swap(true, Ordering::Relaxed) {
+            if let Err(e) = optimize(py, c, None) {
+                e.write_unraisable(py, None);
+            }
+        } else if ELIDE.load(Ordering::Relaxed)
+            && c.returns.fetch_add(1, Ordering::Relaxed) + 1 == ELIDE_AFTER
+            && !c.plan().prep.clones.is_empty()
+        {
+            // By now its clones (and theirs) have been optimized and have
+            // observed: optimize again, eliding what they allow.
+            if let Err(e) = outside_executor(|| optimize_now(py, c, None, true)) {
+                e.write_unraisable(py, None);
+            }
         }
     }
     leave(tstate, frame, gen_frame, outcome)
@@ -592,10 +697,12 @@ impl Drop for ExecGuard {
 /// The CFG the executor runs for `code` (a code object, or a function via
 /// `__code__`), with what was observed running it so far: the side effects at
 /// each site (Python frames entered, torch ops run) and the type of each value.
+/// `clone`: a path of instrs, each with a clone in the one before it (see
+/// _cfg_clones), to show that clone's instead.
 #[pyfunction]
-#[pyo3(signature = (code, effects=true, types=true))]
-pub fn cfg_observed(code: &Bound<'_, PyAny>, effects: bool, types: bool) -> PyResult<String> {
-    let c = unsafe { lookup(code)? };
+#[pyo3(signature = (code, effects=true, types=true, clone=vec![]))]
+pub fn cfg_observed(code: &Bound<'_, PyAny>, effects: bool, types: bool, clone: Vec<u32>) -> PyResult<String> {
+    let c = unsafe { resolve(code, &clone)? };
     let plan = c.plan();
     let mut by_cfg = HashMap::new();
     let mut work = vec![&plan.prep];
@@ -629,10 +736,25 @@ thread_local! {
 // otherwise be recorded as effects of whatever site is running (the call
 // whose callee just returned, for the optimization after a first run).
 fn optimize(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()> {
-    outside_executor(|| optimize_now(py, c, block))
+    outside_executor(|| optimize_now(py, c, block, false))
 }
 
-fn optimize_now(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResult<()> {
+/// Optimize every block of the CFG the executor runs for `code` again, from
+/// its unoptimized CFG, with everything observed so far (see reoptimize).
+#[pyfunction]
+#[pyo3(signature = (code, clone=vec![]))]
+pub fn _reoptimize(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<()> {
+    let c = unsafe { resolve(code, &clone)? };
+    outside_executor(|| optimize_now(code.py(), c, None, true))
+}
+
+// With `again`, starts from the Cfg the code was converted to (the first
+// Plan's) instead of the current one, so blocks optimized before can be
+// optimized differently. Its value ids are the ones observations are kept
+// by; values only later Cfgs had lose theirs, and so do blocks (block sites
+// aren't kept in the first Plan's numbering), and the swap drops what the
+// current Plan built since (training versions, origins' observations).
+fn optimize_now(py: Python<'_>, c: &Compiled, block: Option<BlockId>, again: bool) -> PyResult<()> {
     struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -640,38 +762,436 @@ fn optimize_now(py: Python<'_>, c: &Compiled, block: Option<BlockId>) -> PyResul
         }
     }
     let _reset = Reset(OPTIMIZING.replace(true));
-    let plan = c.plan();
+    let current = c.plan();
+    // Plans are boxed and live as long as c.
+    let plan: &Plan = if again { unsafe { &*(&*c.plans.lock().unwrap()[0] as *const Plan) } } else { current };
+    if again {
+        let n = plan.prep.cfg.instrs.len();
+        unsafe {
+            (*plan.prep.types.get()).truncate(n);
+            (*plan.prep.callees.get()).retain(|v, _| v.idx() < n);
+            (*plan.prep.effects.get()).retain(|s| matches!(s, Site::Instr(v) if v.idx() < n));
+        }
+    }
     let blocks: Vec<BlockId> = match block {
         Some(b) => vec![b],
         None => plan.prep.cfg.block_ids().collect(),
     };
-    let (movable, aten, pinnable, nulls) = observed_ops(py, &plan.prep, &blocks);
+    let (mut movable, aten, pinnable, nulls) = observed_ops(py, &plan.prep, &blocks);
     let mut cfg = (*plan.prep.cfg).clone();
     let (mut objects, mut calls) = (HashMap::new(), HashMap::new());
     for (v, (f, call)) in pinnable {
         objects.insert(v, f);
         calls.insert(v, call);
     }
+    // Calls whose clone's path can be copied in (only with ELIDE on).
+    let mut inlines = HashMap::new();
+    let mut el = Elisions { py, cfg: &mut cfg, pins: vec![], objects: HashMap::new(), next_id: 0 };
+    if ELIDE.load(Ordering::Relaxed) {
+        let consts = c.consts.bind(py).clone();
+        let mut sites: Vec<ValueId> = current.prep.clones.keys().copied().filter(|v| v.idx() < plan.prep.cfg.instrs.len()).collect();
+        sites.sort();
+        for v in sites {
+            if let Some(i) = el.inlinee(&plan.prep, &consts, v, &current.prep.clones[&v]) {
+                if let Ok(d) = std::env::var("TORCH_RUST_ELIDE_DEBUG") {
+                    let q = current.prep.clones[&v].code.bind(py).getattr("co_qualname").map_or("?".into(), |q| q.to_string());
+                    if !d.is_empty() && d != "1" && !d.split(',').any(|x| x == q) {
+                        continue;
+                    }
+                    eprintln!("elide: %{} ({q}) elided", v.0);
+                }
+                movable.insert(v);
+                inlines.insert(v, i);
+            }
+        }
+    }
+    let (mut pins, inline_objects) = (std::mem::take(&mut el.pins), std::mem::take(&mut el.objects));
     let obs = crate::cfg::optimize::Observed { movable, aten, calls, nulls };
-    let mut pinned = vec![];
-    let renumbered = crate::cfg::optimize::optimize_blocks(&mut cfg, &blocks, &obs, &mut pinned, block.is_some())
+    let (mut pinned, mut elided) = (vec![], vec![]);
+    let renumbered = crate::cfg::optimize::optimize_blocks(&mut cfg, &blocks, &obs, &inlines, &mut pinned, &mut elided, block.is_some())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let pins = pinned.iter().map(|v| objects[v].clone_ref(py)).collect();
+    for (id, x, new) in elided {
+        if let Some(o) = inline_objects.get(&(id, x)) {
+            objects.insert(new, o.clone_ref(py));
+        }
+    }
+    pins.extend(pinned.iter().map(|v| objects[v].clone_ref(py)));
     crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
     let record = block.is_some() && plan.prep.record;
-    swap_plan(c, plan, cfg, record, pins, |p| unsafe { &mut *p.effects.get() }.renumber_blocks(&renumbered))
+    let clones = new_clones(py, c, plan, current);
+    swap_plan(c, current, plan, cfg, record, pins, clones, |p| unsafe { &mut *p.effects.get() }.renumber_blocks(&renumbered))
 }
 
-// Makes `cfg`, a changed copy of `plan`'s, the Cfg new frames of c run.
-// `before` runs first, unless another thread replaced `plan` meanwhile.
-// `pins`: what the Cfg's pins beyond plan's resolve to.
-fn swap_plan(c: &Compiled, plan: &Plan, cfg: Cfg, record: bool, pins: Vec<Py<PyAny>>, before: impl FnOnce(&Prepared)) -> PyResult<()> {
+// Clones for the instrs of `plan`'s top-level blocks that entered a Python
+// function directly on every visit (see Prepared::clones), other than those
+// `current` has. Generators aren't cloned (a resumed generator frame finds its
+// Compiled by code object).
+fn new_clones(py: Python<'_>, c: &Compiled, plan: &Plan, current: &Plan) -> HashMap<ValueId, SiteClone> {
+    let mut out = HashMap::new();
+    if c.depth >= MAX_CLONE_DEPTH {
+        return out;
+    }
+    let prep = &plan.prep;
+    let (callees, effects) = unsafe { (&*prep.callees.get(), &*prep.effects.get()) };
+    for v in prep.cfg.blocks.iter().flat_map(|b| &b.versions).flat_map(|ver| &ver.body) {
+        if current.prep.clones.contains_key(v) {
+            continue;
+        }
+        let Some(f) = callees.get(v).and_then(|c| c.get(py)) else { continue };
+        let site = Site::Instr(*v);
+        let seqs = effects.get(site);
+        let entered = !effects.varies(site)
+            && !seqs.is_empty()
+            && seqs.iter().all(|(seq, _)| {
+                seq.iter().filter(|e| matches!(e, effects::Effect::Frame { how: effects::How::Direct, .. })).count() == 1
+            });
+        if !entered || unsafe { pyo3::ffi::PyFunction_Check(f.as_ptr()) } == 0 {
+            continue;
+        }
+        let Ok(code) = f.getattr("__code__") else { continue };
+        let Ok(mut clone) = Compiled::new(&code) else { continue };
+        if clone.flags & GENERATOR_FLAGS != 0 {
+            continue;
+        }
+        clone.depth = c.depth + 1;
+        out.insert(*v, SiteClone { code: code.unbind(), compiled: Arc::new(clone) });
+    }
+    out
+}
+
+// Builds the elisions of calls in `cfg` (see cfg/inline.rs): for each call
+// with a clone whose observed path can be copied into the caller, its
+// Inlinee, with the objects it pins appended to cfg.pins and to `pins`, and
+// what the callee's pinned calls pin, by (inlinee id, callee instr), added to
+// `objects`. The calls are made movable.
+struct Elisions<'a> {
+    py: Python<'a>,
+    cfg: &'a mut Cfg,
+    pins: Vec<Py<PyAny>>,
+    objects: HashMap<(usize, ValueId), Py<PyAny>>,
+    next_id: usize,
+}
+
+impl Elisions<'_> {
+    fn pin(&mut self, name: String, obj: Bound<'_, PyAny>) -> u32 {
+        self.cfg.pins.push(crate::cfg::ir::Pin { name, path: None });
+        self.pins.push(obj.unbind());
+        self.cfg.pins.len() as u32 - 1
+    }
+
+    fn name(&mut self, n: &str) -> u32 {
+        match self.cfg.names.iter().position(|x| x == n) {
+            Some(i) => i as u32,
+            None => {
+                self.cfg.names.push(n.to_string());
+                self.cfg.names.len() as u32 - 1
+            }
+        }
+    }
+
+    // `prep`: the caller's (its unoptimized Plan's, whose ids `v` is in);
+    // `consts`: its code's co_consts.
+    fn inlinee(&mut self, prep: &Prepared, consts: &Bound<'_, PyTuple>, v: ValueId, clone: &SiteClone) -> Option<crate::cfg::inline::Inlinee> {
+        let r = self.try_inlinee(prep, consts, v, clone);
+        if r.is_none() && std::env::var_os("TORCH_RUST_ELIDE_DEBUG").is_some() {
+            let q = clone.code.bind(self.py).getattr("co_qualname").map_or("?".into(), |q| q.to_string());
+            eprintln!("elide: %{} ({q}) refused: {}", v.0, ELIDE_WHY.take().unwrap_or_default());
+        }
+        r
+    }
+
+    fn try_inlinee(&mut self, prep: &Prepared, consts: &Bound<'_, PyTuple>, v: ValueId, clone: &SiteClone) -> Option<crate::cfg::inline::Inlinee> {
+        use crate::cfg::inline::{Bind, Callable, Inlinee, Site as How};
+        use types::{Kind, Konst, Ty};
+        let py = self.py;
+        let ins = prep.cfg[v].clone();
+        let callee = unsafe { &*prep.callees.get() }.get(&v)?;
+        let f = callee.get(py)?;
+        let code = f.getattr("__code__").ok()?;
+        if !code.is(clone.code.bind(py)) {
+            return None;
+        }
+        let types = unsafe { &*prep.types.get() };
+        let kinds = |x: ValueId| types.get(x.idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds);
+        let is_class = |x: ValueId, tp: *const pyo3::ffi::PyTypeObject| matches!(kinds(x), Some([Kind::Object(c)]) if c.is(tp));
+        // How the instr calls f, how many positional args (counting self) it
+        // passes, and the keyword names.
+        let (site, npos, kw): (How, usize, Vec<String>) = match (&ins.op, callee.via()?) {
+            (Op::Call { kw_names, .. }, via) => {
+                let kw: Vec<String> = match kw_names {
+                    Some(k) => consts.get_item(*k as usize).ok()?.extract().ok()?,
+                    None => vec![],
+                };
+                let method = ins.args[0] != crate::cfg::ir::NULL && !matches!(kinds(ins.args[0]), Some([Kind::Null]));
+                let n = ins.args.len() - 2 + method as usize;
+                let callable = match via {
+                    effects::Via::Call => Callable::Instance,
+                    effects::Via::Callable if method => Callable::Function,
+                    effects::Via::Callable if is_class(ins.args[1], &raw const ffi::PyMethod_Type) => Callable::BoundMethod,
+                    effects::Via::Callable => Callable::Function,
+                    effects::Via::Getattr => return None,
+                };
+                let n = n + matches!(callable, Callable::Instance | Callable::BoundMethod) as usize;
+                (How::Call { ex: false, method, callable }, n.checked_sub(kw.len())?, kw)
+            }
+            (Op::Bytecode { opcode: opcodes::CALL_FUNCTION_EX, .. }, via) => {
+                let n = match kinds(ins.args[1]) {
+                    Some([Kind::Tuple(items)]) => items.len(),
+                    _ => return None,
+                };
+                if ins.args.len() == 3 && !matches!(kinds(ins.args[2]), Some([Kind::Dict(len)]) if *len == types::Interval::exact(0)) {
+                    return None;
+                }
+                let callable = match via {
+                    effects::Via::Call => Callable::Instance,
+                    effects::Via::Callable if is_class(ins.args[0], &raw const ffi::PyMethod_Type) => Callable::BoundMethod,
+                    effects::Via::Callable => Callable::Function,
+                    effects::Via::Getattr => return None,
+                };
+                let n = n + matches!(callable, Callable::Instance | Callable::BoundMethod) as usize;
+                (How::Call { ex: true, method: false, callable }, n, vec![])
+            }
+            (Op::LoadAttr(n) | Op::LoadMethod(n), effects::Via::Getattr) => {
+                let attr = prep.cfg.names[*n as usize].clone();
+                let s = pyo3::types::PyString::intern(py, &attr).into_any();
+                let site = How::Getattr { name: self.name(&attr), str: self.pin(format!("{attr:?}"), s) };
+                (site, 2, vec![])
+            }
+            _ => return None,
+        };
+        let attr = |n: &str| code.getattr(n).ok();
+        let int = |n: &str| attr(n).and_then(|x| x.extract::<usize>().ok());
+        let (argcount, posonly, kwonly) = (int("co_argcount")?, int("co_posonlyargcount")?, int("co_kwonlyargcount")?);
+        let flags = int("co_flags")?;
+        let (varargs, varkw) = (flags & 0x04 != 0, flags & 0x08 != 0);
+        // Cells are fine (they become values); free variables aren't.
+        if attr("co_freevars").and_then(|x| x.len().ok()) != Some(0) {
+            return None;
+        }
+        let varnames: Vec<String> = attr("co_varnames")?.extract().ok()?;
+        let named = argcount + kwonly;
+        if npos > argcount && !varargs {
+            return None;
+        }
+        let mut bind: Vec<Option<Bind>> = (0..named).map(|i| (i < npos).then_some(Bind::Arg(i))).collect();
+        for (j, name) in kw.iter().enumerate() {
+            let i = varnames[..named].iter().position(|n| n == name).filter(|i| *i >= posonly)?;
+            if bind[i].is_some() {
+                return None;
+            }
+            bind[i] = Some(Bind::Arg(npos + j));
+        }
+        let defaults = f.getattr("__defaults__").ok().filter(|d| !d.is_none());
+        let nd = defaults.as_ref().map_or(0, |d| d.len().unwrap_or(0));
+        let mut used_defaults = false;
+        for (i, slot) in bind.iter_mut().enumerate() {
+            if slot.is_none() {
+                if !(i < argcount && i + nd >= argcount) {
+                    return None;
+                }
+                let d = defaults.as_ref()?.get_item(i + nd - argcount).ok()?;
+                let name = d.repr().map_or("?".into(), |r| r.to_string());
+                *slot = Some(Bind::Pin(self.pin(name, d)));
+                used_defaults = true;
+            }
+        }
+        let mut bind: Vec<Bind> = bind.into_iter().map(|b| b.expect("bound")).collect();
+        if varargs {
+            bind.push(Bind::VarArgs(argcount.min(npos)));
+        }
+        if varkw {
+            bind.push(Bind::VarKw);
+        }
+        let nslots = bind.len() as u32;
+
+        // The callee's path, from what its clone observed.
+        let base = unsafe { &*(&*clone.compiled.plans.lock().unwrap()[0] as *const Plan) };
+        let bprep = &base.prep;
+        let blocks: Vec<BlockId> = bprep.cfg.block_ids().collect();
+        let (movable, aten, pinnable, nulls) = observed_ops(py, bprep, &blocks);
+        let (btypes, beffects) = unsafe { (&*bprep.types.get(), &*bprep.effects.get()) };
+        // Reads that ran no Python code and no torch op when observed (an
+        // instance's attribute, a dict lookup): fine to copy in, since the
+        // copy still does the read (nothing guards the class yet).
+        let quiet = |x: ValueId| {
+            let site = Site::Instr(x);
+            !beffects.varies(site) && beffects.get(site).iter().all(|(seq, _)| seq.is_empty())
+        };
+        let cfg = bprep.cfg.clone();
+        // What a load chain in the callee (a global, then module attributes)
+        // gives now, read through f's globals; and the in-graph calls of such
+        // a chain that ran nothing observable, which the caller may pin.
+        let fglobals = f.getattr("__globals__").ok()?;
+        let fbuiltins = f.getattr("__builtins__").ok()?;
+        fn resolve<'py>(cfg: &Cfg, x: ValueId, g: &Bound<'py, PyAny>, bi: &Bound<'py, PyAny>) -> Option<Bound<'py, PyAny>> {
+            let ins = &cfg[x];
+            match ins.op {
+                Op::LoadGlobal(n) => {
+                    let name = &cfg.names[n as usize];
+                    g.get_item(name).ok().or_else(|| bi.get_item(name).ok())
+                }
+                Op::LoadAttr(n) | Op::LoadMethod(n) => {
+                    let m = resolve(cfg, ins.args[0], g, bi)?;
+                    m.is_exact_instance_of::<pyo3::types::PyModule>().then_some(())?;
+                    m.getattr(cfg.names[n as usize].as_str()).ok()
+                }
+                Op::Project(1) => resolve(cfg, ins.args[0], g, bi),
+                _ => None,
+            }
+        }
+        let mut quiet_calls: HashMap<ValueId, crate::cfg::optimize::PinnedCall> = HashMap::new();
+        let mut quiet_objects: Vec<(ValueId, Py<PyAny>)> = vec![];
+        let cprep = &clone.compiled.plan().prep;
+        let deeper = clone.compiled.depth < MAX_CLONE_DEPTH;
+        let mut dirs = HashMap::new();
+        let mut nested = HashMap::new();
+        let mut defined: HashSet<u32> = (0..nslots).collect();
+        let mut seen = HashSet::new();
+        let mut b = crate::cfg::ir::ENTRY;
+        let cconsts = clone.compiled.consts.bind(py).clone();
+        loop {
+            if !seen.insert(b) {
+                return None;
+            }
+            let blk = &cfg[b];
+            let [ver] = &blk.versions[..] else { return None };
+            for x in &ver.body {
+                let op = &cfg[*x].op;
+                let mut nest = |me: &mut Self| match cprep.clones.get(x).filter(|_| deeper) {
+                    Some(sub) => match me.inlinee(bprep, &cconsts, *x, sub) {
+                        Some(i) => {
+                            nested.insert(*x, i);
+                            true
+                        }
+                        None => false,
+                    },
+                    None => false,
+                };
+                let ok = match op {
+                    Op::Resume | Op::Project(_) | Op::MakeCell { .. } => true,
+                    Op::LoadLocal { slot } | Op::LoadLocalChecked { slot } | Op::LoadDeref { slot } => defined.contains(slot),
+                    Op::StoreLocal { slot } | Op::StoreDeref { slot } => {
+                        defined.insert(*slot);
+                        true
+                    }
+                    Op::Bytecode { opcode: opcodes::BUILD_MAP, arg: 0 } | Op::Bytecode { opcode: opcodes::DICT_MERGE, arg: 1 } => true,
+                    Op::LoadAttr(_) | Op::LoadMethod(_) => movable.contains(x) || quiet(*x) || nest(self),
+                    Op::LoadGlobal(_) | Op::Const(_) | Op::Binary(_) | Op::Compare(_) | Op::BuildTuple(_) => movable.contains(x),
+                    Op::ToBool | Op::IsNone => movable.contains(x) || quiet(*x),
+                    Op::Bytecode { opcode, .. } => {
+                        matches!(
+                            *opcode,
+                            opcodes::UNARY_NEGATIVE | opcodes::UNARY_NOT | opcodes::UNARY_INVERT | opcodes::BINARY_SUBSCR | opcodes::IS_OP | opcodes::CONTAINS_OP | opcodes::BUILD_LIST
+                        ) && (movable.contains(x) || quiet(*x))
+                            || *opcode == opcodes::CALL_FUNCTION_EX && (movable.contains(x) || nest(self))
+                    }
+                    Op::Call { .. } => {
+                        movable.contains(x) || nest(self) || {
+                            let a = &cfg[*x].args;
+                            let target = resolve(&cfg, a[1], &fglobals, &fbuiltins).filter(|_| a[0] == crate::cfg::ir::NULL || matches!(cfg[a[0]].op, Op::Project(0)));
+                            match target {
+                                Some(t) if quiet(*x) && is_in_graph(&t) => {
+                                    let name = t.getattr("__qualname__").map_or("?".into(), |q| q.to_string());
+                                    let has_torch_function = is_has_torch_function(&t);
+                                    quiet_calls.insert(*x, crate::cfg::optimize::PinnedCall { name, args: None, has_torch_function });
+                                    quiet_objects.push((*x, t.unbind()));
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    if ELIDE_WHY.with_borrow(|w| w.is_none()) {
+                        why(format!("{:?} %{} in bb{}", op, x.0, b.0));
+                    }
+                    return None;
+                }
+            }
+            let next = match &blk.term {
+                Terminator::Jump(e) => e,
+                Terminator::Branch { cond, then, else_ } => {
+                    let c = ver.outputs[*cond as usize];
+                    let dir = match btypes.get(c.idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
+                        Some([Kind::Bool(Konst::Is(d))]) => *d,
+                        _ => {
+                            why(format!("bb{}'s branch went both ways", b.0));
+                            return None;
+                        }
+                    };
+                    dirs.insert(b, dir);
+                    if dir { then } else { else_ }
+                }
+                _ => return None,
+            };
+            match next {
+                Exit::Return(_) => break,
+                Exit::Block(e) => b = e.target,
+                Exit::Leave(_) => return None,
+            }
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut calls = HashMap::new();
+        for (x, (obj, call)) in pinnable {
+            self.objects.insert((id, x), obj);
+            calls.insert(x, call);
+        }
+        for (x, obj) in quiet_objects {
+            self.objects.insert((id, x), obj);
+        }
+        calls.extend(quiet_calls);
+        let function = self.pin(callee.describe(py), f.clone());
+        let defaults = if used_defaults {
+            let d = defaults.expect("defaults were bound");
+            let pin = self.pin("__defaults__".into(), d);
+            Some((pin, self.name("__defaults__")))
+        } else {
+            None
+        };
+        let globals = self.pin("globals".into(), f.getattr("__globals__").ok()?);
+        let builtins = self.pin("builtins".into(), f.getattr("__builtins__").ok()?);
+        let mut cs = vec![];
+        for k in cconsts.iter() {
+            let name = k.repr().map_or("?".into(), |r| r.to_string());
+            cs.push(self.pin(name, k));
+        }
+        let names = [self.name("__func__"), self.name("__self__"), self.name("__call__")];
+        let obs = crate::cfg::optimize::Observed { movable: Default::default(), aten, calls, nulls };
+        Some(Inlinee { id, obs, cfg, dirs, site, bind, function, defaults, globals, builtins, consts: cs, nested, names })
+    }
+}
+
+// Makes `cfg`, a changed copy of `base`'s, the Cfg new frames of c run in
+// place of `current`'s (usually base). `before` runs first, unless another
+// thread replaced `current` meanwhile. `pins`: what the Cfg's pins beyond
+// base's resolve to.
+#[allow(clippy::too_many_arguments)]
+fn swap_plan(
+    c: &Compiled,
+    current: &Plan,
+    base: &Plan,
+    cfg: Cfg,
+    record: bool,
+    pins: Vec<Py<PyAny>>,
+    clones: HashMap<ValueId, SiteClone>,
+    before: impl FnOnce(&Prepared),
+) -> PyResult<()> {
     let mut plans = c.plans.lock().unwrap();
-    if !std::ptr::eq(c.plan(), plan) {
+    if !std::ptr::eq(c.plan(), current) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err("the CFG was optimized concurrently"));
     }
-    before(&plan.prep);
-    let mut new = Box::new(Plan::new(cfg, Some(plan), record, pins)?);
+    before(&base.prep);
+    let mut new = Box::new(Plan::new(cfg, Some(base), record, pins, &c.consts, &c.names)?);
+    Python::attach(|py| {
+        for (v, cl) in &current.prep.clones {
+            new.prep.clones.insert(*v, SiteClone { code: cl.code.clone_ref(py), compiled: cl.compiled.clone() });
+        }
+    });
+    new.prep.clones.extend(clones);
     c.plan.store(&mut *new, Ordering::Release);
     plans.push(new);
     Ok(())
@@ -679,8 +1199,7 @@ fn swap_plan(c: &Compiled, plan: &Plan, cfg: Cfg, record: bool, pins: Vec<Py<PyA
 
 // Gives block b of code's Cfg a version running `t` (see autograd.rs), if
 // the Cfg is still the one whose Prepared is at `prep`.
-pub(crate) fn add_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, checks: Vec<Check>, t: Training) -> PyResult<()> {
-    let c = unsafe { lookup(code)? };
+pub(crate) fn add_training(c: &Compiled, prep: usize, b: BlockId, checks: Vec<Check>, t: Training) -> PyResult<()> {
     let plan = c.plan();
     if &plan.prep as *const Prepared as usize != prep {
         return Err(pyo3::exceptions::PyRuntimeError::new_err("the CFG changed since the block ran"));
@@ -689,7 +1208,7 @@ pub(crate) fn add_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, che
     crate::cfg::partition::add_training_version(&mut cfg, b, checks, t)
         .map_err(|e| pyo3::exceptions::PyNotImplementedError::new_err(format!("no training version for bb{}: {e}", b.0)))?;
     crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
-    swap_plan(c, plan, cfg, plan.prep.record, vec![], |_| {})?;
+    swap_plan(c, plan, plan, cfg, plan.prep.record, vec![], HashMap::new(), |_| {})?;
     // The blocks keep their ids: those that gave up stay given up.
     let new = &c.plan().prep;
     for (i, flag) in plan.prep.autograd.iter().enumerate() {
@@ -702,13 +1221,11 @@ pub(crate) fn add_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, che
 
 // Stops block b of code's Cfg from bootstrapping (it can't get a training
 // version), if the Cfg is still the one whose Prepared is at `prep`.
-pub(crate) fn no_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, why: String) {
-    if let Ok(c) = unsafe { lookup(code) } {
-        let plan = c.plan();
-        if &plan.prep as *const Prepared as usize == prep {
-            plan.prep.autograd[b.idx()].store(false, Ordering::Relaxed);
-            unsafe { *plan.prep.autograd_why[b.idx()].get() = Some(why) };
-        }
+pub(crate) fn no_training(c: &Compiled, prep: usize, b: BlockId, why: String) {
+    let plan = c.plan();
+    if &plan.prep as *const Prepared as usize == prep {
+        plan.prep.autograd[b.idx()].store(false, Ordering::Relaxed);
+        unsafe { *plan.prep.autograd_why[b.idx()].get() = Some(why) };
     }
 }
 
@@ -718,8 +1235,9 @@ pub(crate) fn no_training(code: &Bound<'_, PyAny>, prep: usize, b: BlockId, why:
 /// (it bootstraps when next run with grad needed), "gave up: why" (its
 /// backward couldn't be compiled) or "ineligible: why".
 #[pyfunction]
-pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>) -> PyResult<Vec<(u32, u32, String)>> {
-    let c = unsafe { lookup(code)? };
+#[pyo3(signature = (code, clone=vec![]))]
+pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<(u32, u32, String)>> {
+    let c = unsafe { resolve(code, &clone)? };
     let prep = &c.plan().prep;
     let cfg = &prep.cfg;
     let mut out = vec![];
@@ -748,12 +1266,15 @@ pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>) -> PyResult<Vec<(u32, u32, 
 /// `code`. Each check is a tuple: ("grad_enabled", bool),
 /// ("requires_grad", param, bool), ("tensor", param, example tensor),
 /// ("value", param, None | bool | int | float), ("no_forward_ad",),
-/// ("no_saved_tensor_hooks",).
+/// ("no_saved_tensor_hooks",); and, to test restarting, ("restart",) and
+/// ("expect", param, bool) and ("expect_is", param, object) (see
+/// Op::Expect).
 #[pyfunction]
 pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<'_, PyTuple>>) -> PyResult<()> {
     let c = unsafe { lookup(code)? };
     let plan = c.plan();
     let mut cfg = (*plan.prep.cfg).clone();
+    let mut pins: Vec<Py<PyAny>> = vec![];
     let b = BlockId(block);
     if b.idx() >= cfg.blocks.len() || cfg[b].origin.is_none() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!("bb{block} has no origin")));
@@ -787,12 +1308,36 @@ pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<
             "value" => Check::Value(param()?, lit(&t.get_item(2)?).ok_or_else(|| bad(t))?),
             "no_forward_ad" => Check::NoForwardAD,
             "no_saved_tensor_hooks" => Check::NoSavedTensorHooks,
+            // Not guard checks: an Expect on a param at the start of the
+            // body, and making the version restart.
+            "expect" | "expect_is" | "restart" => {
+                let ver = &mut cfg[b].versions[0];
+                ver.restart = true;
+                if kind != "restart" {
+                    let p = *cfg[b].params.get(param()? as usize).ok_or_else(|| bad(t))?;
+                    let origin = cfg[b].versions[0].body.first().map_or(0, |v| cfg[*v].origin);
+                    let op = if kind == "expect" {
+                        Op::Expect(t.get_item(2)?.extract()?)
+                    } else {
+                        let obj = t.get_item(2)?;
+                        cfg.pins.push(crate::cfg::ir::Pin { name: obj.repr()?.to_string(), path: None });
+                        pins.push(obj.unbind());
+                        Op::ExpectIs(cfg.pins.len() as u32 - 1)
+                    };
+                    let e = cfg.add(op, vec![p], origin);
+                    cfg[b].versions[0].body.insert(0, e);
+                    for seg in cfg[b].versions[0].unwind.iter_mut().filter(|s| s.from > 0) {
+                        seg.from += 1;
+                    }
+                }
+                continue;
+            }
             _ => return Err(bad(t)),
         };
         cfg[b].versions[0].guard.checks.push(check);
     }
     crate::cfg::verify::verify(&cfg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
-    swap_plan(c, plan, cfg, plan.prep.record, vec![], |_| {})
+    swap_plan(c, plan, plan, cfg, plan.prep.record, pins, HashMap::new(), |_| {})
 }
 
 // A scalar as a Lit (bool before int: bool is an int subclass).
@@ -813,9 +1358,20 @@ pub(crate) fn lit(o: &Bound<'_, PyAny>) -> Option<Lit> {
 /// How many times each block of the CFG the executor runs for `code` found
 /// no version whose guard held (and ran its origin), since the CFG last
 /// changed.
+/// By block of the CFG the executor runs for `code` (or a clone of it, see
+/// cfg_observed): how many times a version that restarts was abandoned for
+/// its origin.
 #[pyfunction]
-pub fn _cfg_misses(code: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-    let c = unsafe { lookup(code)? };
+#[pyo3(signature = (code, clone=vec![]))]
+pub fn _cfg_aborts(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<u32>> {
+    let c = unsafe { resolve(code, &clone)? };
+    Ok(c.plan().prep.aborts.iter().map(|m| m.load(Ordering::Relaxed)).collect())
+}
+
+#[pyfunction]
+#[pyo3(signature = (code, clone=vec![]))]
+pub fn _cfg_misses(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<u32>> {
+    let c = unsafe { resolve(code, &clone)? };
     Ok(c.plan().prep.misses.iter().map(|m| m.load(Ordering::Relaxed)).collect())
 }
 
@@ -924,7 +1480,7 @@ fn observed_ops(
                 | Op::Resume
                 | Op::EvalBreaker
                 | Op::LoadGlobal(_) => true,
-                _ if callees.contains_key(v) => {
+                _ if callees.get(v).is_some_and(|c| c.via() == Some(effects::Via::Callable)) => {
                     let site = Site::Instr(*v);
                     let seqs = effects.get(site);
                     // Every visit entered the callee's frame and nothing else
@@ -944,7 +1500,10 @@ fn observed_ops(
                         };
                         let first = seqs.first().and_then(|(seq, _)| op(seq));
                         let one_op = first.is_some() && seqs.iter().all(|(seq, _)| op(seq) == first);
-                        calls.push((*v, f.unbind(), one_op.then_some(args()), false));
+                        // Or ran nothing observable (a predicate): pinnable
+                        // too, though its result isn't a tensor.
+                        let quiet = !seqs.is_empty() && seqs.iter().all(|(seq, _)| seq.is_empty());
+                        calls.push((*v, f.unbind(), (one_op || quiet).then(|| if one_op { args() } else { None }), false));
                     }
                     false
                 }
@@ -991,7 +1550,8 @@ fn observed_ops(
                     (Some(m), Some(q)) => format!("{m}.{q}"),
                     (_, q) => q.unwrap_or_else(|| "?".into()),
                 };
-                pinnable.insert(v, (f, PinnedCall { name, args }));
+                let has_torch_function = is_has_torch_function(f.bind(py));
+                pinnable.insert(v, (f, PinnedCall { name, args, has_torch_function }));
             }
         }
     }
@@ -1008,13 +1568,27 @@ fn observed_ops(
 }
 
 // The torch ops a call of Python function `f` was seen to run, if every one
-// ran in f's own frame, which entered no other Python frame: then f is a leaf,
+// ran in f's own frame, which entered no other Python frame and has no
+// writes other than to its own locals: then f is a leaf,
 // which Dynamo's in-graph functions (`F.relu`, `F.layer_norm`) usually are, and
 // a call of it can be treated like a call of a builtin.
 fn leaf_ops(f: &Bound<'_, PyAny>) -> Option<Vec<String>> {
     let code = f.getattr("__code__").ok()?;
     let c = unsafe { lookup(&code) }.ok()?;
-    let effects = unsafe { &*c.plans.lock().unwrap()[0].prep.effects.get() };
+    let first = unsafe { &*(&*c.plans.lock().unwrap()[0] as *const Plan) };
+    // Writes to anything but its own locals would be repeated by a rerun.
+    let writes = first.prep.cfg.instrs.iter().any(|i| match i.op {
+        Op::StoreAttr(_) | Op::StoreDeref { .. } | Op::DeleteDeref { .. } => true,
+        Op::Bytecode { opcode, .. } => matches!(
+            opcode,
+            opcodes::STORE_GLOBAL | opcodes::DELETE_GLOBAL | opcodes::STORE_SUBSCR | opcodes::DELETE_SUBSCR | opcodes::DELETE_ATTR | opcodes::STORE_NAME | opcodes::DELETE_NAME
+        ),
+        _ => false,
+    });
+    if writes {
+        return None;
+    }
+    let effects = unsafe { &*first.prep.effects.get() };
     let mut ops = vec![];
     for (seqs, varies) in effects.sites() {
         if varies {
@@ -1049,6 +1623,14 @@ fn unrepeatable(py: Python<'_>, op: &str) -> bool {
     r
 }
 
+// Whether `f` is torch._C._has_torch_function{,_unary,_variadic}.
+fn is_has_torch_function(f: &Bound<'_, PyAny>) -> bool {
+    let Ok(c) = f.py().import("torch._C") else { return false };
+    ["_has_torch_function", "_has_torch_function_unary", "_has_torch_function_variadic"]
+        .iter()
+        .any(|n| c.getattr(*n).is_ok_and(|g| g.is(f)))
+}
+
 // Whether Dynamo puts calls to `f` in its graphs.
 fn is_in_graph(f: &Bound<'_, PyAny>) -> bool {
     f.py()
@@ -1078,6 +1660,38 @@ unsafe fn lookup<'a>(code: &Bound<'_, PyAny>) -> PyResult<&'a Compiled> {
     Ok(&*(p as *const Compiled))
 }
 
+// The Compiled of `code` (see lookup), or of the clone `path` leads to: each
+// instr has a clone in the Compiled before it. Clones live as long as the
+// Plans holding them, so as long as `code`'s Compiled.
+unsafe fn resolve<'a>(code: &Bound<'_, PyAny>, path: &[u32]) -> PyResult<&'a Compiled> {
+    let mut c: &Compiled = lookup(code)?;
+    for v in path {
+        let Some(cl) = c.plan().prep.clones.get(&ValueId(*v)) else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!("%{v} has no clone")));
+        };
+        c = &*Arc::as_ptr(&cl.compiled);
+    }
+    Ok(c)
+}
+
+/// For coverage reports: the clones the CFG the executor runs for `code` has
+/// (or the clone `clone` leads to, see cfg_observed), as (instr, the cloned
+/// function's qualname).
+#[pyfunction]
+#[pyo3(signature = (code, clone=vec![]))]
+pub fn _cfg_clones(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<(u32, String)>> {
+    let c = unsafe { resolve(code, &clone)? };
+    let mut out: Vec<(u32, String)> = c
+        .plan()
+        .prep
+        .clones
+        .iter()
+        .map(|(v, cl)| (v.0, cl.code.bind(code.py()).getattr("co_qualname").and_then(|q| q.extract()).unwrap_or_default()))
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
 struct Observed<'a> {
     by_cfg: HashMap<*const Cfg, &'a Prepared>,
     effects: bool,
@@ -1095,16 +1709,17 @@ impl Annotations for Observed<'_> {
             // Describing runs Python code, which may record, so not holding
             // the table.
             let py = unsafe { Python::assume_attached() };
-            let callee = unsafe { &*prep.callees.get() }.get(&v).map(|c| match c {
-                effects::Callee::One { ptr, weak, obj } => effects::Callee::One {
-                    ptr: *ptr,
-                    weak: *weak,
-                    obj: obj.clone_ref(py),
-                },
-                effects::Callee::Many => effects::Callee::Many,
-            });
+            let callee = unsafe { &*prep.callees.get() }.get(&v).map(|c| c.clone_ref(py));
+            if prep.clones.contains_key(&v) {
+                lines.push("cloned".into());
+            }
             if let Some(c) = callee {
-                lines.push(format!("callee {}", c.describe(py)));
+                let via = match c.via() {
+                    Some(effects::Via::Call) => " (via __call__)",
+                    Some(effects::Via::Getattr) => " (via __getattr__)",
+                    _ => "",
+                };
+                lines.push(format!("callee {}{via}", c.describe(py)));
             }
         }
         let table = unsafe { &*prep.effects.get() };

@@ -142,7 +142,7 @@ impl Builder {
         let mut blk = Block::new();
         blk.params = params;
         let n = outputs.len();
-        blk.versions.push(Version { guard: Guard::default(), body: self.body, outputs, unwind: vec![] });
+        blk.versions.push(Version { guard: Guard::default(), body: self.body, outputs, unwind: vec![], restart: false });
         blk.term = Terminator::Jump(Exit::Leave((0..n as u32).collect()));
         self.cfg.boundary = Some(Boundary { n_outputs: n, handler_arity: vec![] });
         self.cfg.blocks.push(blk);

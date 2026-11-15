@@ -54,7 +54,8 @@ pub fn enabled() -> bool {
 
 // Why block b may not get its own node, if it may not. It may when it's a
 // pure block (it has an origin to bootstrap from) whose only version runs
-// aten ops and nothing that could read or change other state.
+// aten ops and nothing that could read or change other state, after its
+// read prefix if it has one.
 pub fn ineligible(cfg: &Cfg, b: BlockId) -> Option<String> {
     let blk = &cfg[b];
     if blk.origin.is_none() {
@@ -75,11 +76,12 @@ pub fn ineligible(cfg: &Cfg, b: BlockId) -> Option<String> {
             Op::Aten { .. } | Op::Const(_) | Op::Lit(_) | Op::Project(_) | Op::BuildTuple(_) | Op::Resume | Op::Null | Op::Pinned(_)
         ) || pinned_call(v)
     };
-    if let Some(v) = ver.body.iter().find(|v| !allowed(**v)) {
+    let compute = &ver.body[crate::cfg::partition::prefix_len(cfg, ver)..];
+    if let Some(v) = compute.iter().find(|v| !allowed(**v)) {
         let op = format!("{:?}", cfg[*v].op);
         return Some(format!("runs {}", op.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("?")));
     }
-    if !ver.body.iter().any(|v| matches!(cfg[*v].op, Op::Aten { .. }) || pinned_call(*v)) {
+    if !compute.iter().any(|v| matches!(cfg[*v].op, Op::Aten { .. }) || pinned_call(*v)) {
         return Some("runs no aten op".into());
     }
     None
@@ -124,7 +126,7 @@ struct Run {
     forward: Option<super::Prepared>,
     // Where the block is, and what its training version needs, or why it
     // can't get one.
-    at: Option<(Where, Py<PyAny>)>,
+    at: Option<Where>,
     site: Result<Site, String>,
 }
 
@@ -262,8 +264,8 @@ fn bootstrap_backward(py: Python<'_>, run: &mut Run, grads: &[Bound<'_, PyAny>])
                 (format!("unsupported: {msg}"), Some(msg))
             }
         };
-        if let (Some(why), Some((at, code))) = (why, &run.at) {
-            super::no_training(code.bind(py), at.prep, at.block, why);
+        if let (Some(why), Some(at)) = (why, &run.at) {
+            super::no_training(&at.compiled, at.prep, at.block, why);
         }
         *LAST_JOINT.lock().unwrap() = Some(text);
     }
@@ -276,7 +278,7 @@ fn train(py: Python<'_>, run: &Run, grads: &[Bound<'_, PyAny>], records: &Bound<
     let (tensors, leaves) = (bound(py, &run.tensors), bound(py, &run.leaves));
     let joint = super::joint::build(&tensors, grads, records, run.fwd_records, &leaves, got)?;
     let text = joint.cfg.render(false, false);
-    let (Ok(site), Some((at, code))) = (&run.site, &run.at) else {
+    let (Ok(site), Some(at)) = (&run.site, &run.at) else {
         return Ok(text);
     };
     let split = joint.partition();
@@ -292,7 +294,7 @@ fn train(py: Python<'_>, run: &Run, grads: &[Bound<'_, PyAny>], records: &Bound<
         wrap: run.wrap.clone(),
         outputs: site.outputs.clone(),
     };
-    super::add_training(code.bind(py), at.prep, at.block, site.checks.clone(), training)?;
+    super::add_training(&at.compiled, at.prep, at.block, site.checks.clone(), training)?;
     Ok(text)
 }
 
@@ -381,6 +383,7 @@ pub unsafe fn forward(tp: &Arc<TrainingPrep>, params: &[*mut PyObject]) -> PyRes
             Template::Param(i) => unsafe { Bound::from_borrowed_ptr(py, params[*i as usize]) },
             Template::Out(k) => leaves[*k as usize].clone(),
             Template::Lit(l) => super::lit_object(py, l)?.into_bound(py),
+            Template::Null => unreachable!("only a whole output"),
             Template::Tuple(ts) => {
                 let items = ts.iter().map(|t| make(py, t, params, leaves)).collect::<PyResult<Vec<_>>>()?;
                 PyTuple::new(py, items)?.into_any()
@@ -392,15 +395,16 @@ pub unsafe fn forward(tp: &Arc<TrainingPrep>, params: &[*mut PyObject]) -> PyRes
         .map(|t| match t {
             // A NULL param passed on.
             Template::Param(i) if params[*i as usize].is_null() => Ok(std::ptr::null_mut()),
+            Template::Null => Ok(std::ptr::null_mut()),
             t => make(py, t, params, &leaves).map(Bound::into_ptr),
         })
         .collect()
 }
 
-// Where a bootstrapped block runs: its code object, the address of the
-// Prepared (a Plan's) it runs under, and the block.
+// Where a bootstrapped block runs: its code's Compiled (or a clone), the
+// address of the Prepared (a Plan's) it runs under, and the block.
 pub struct Where {
-    pub code: *mut PyObject,
+    pub compiled: Arc<super::Compiled>,
     pub prep: usize,
     pub block: BlockId,
 }
@@ -488,7 +492,7 @@ impl Bootstrap {
         }
         if let Some(why) = untrainable {
             call.into_iter().for_each(|o| pyo3::ffi::Py_XDECREF(o));
-            super::no_training(&Bound::from_borrowed_ptr(py, at.code), at.prep, at.block, why);
+            super::no_training(&at.compiled, at.prep, at.block, why);
             return Ok(None);
         }
         let records = PyList::empty(py);
@@ -500,7 +504,6 @@ impl Bootstrap {
                 return Err(e);
             }
         };
-        let code = Bound::from_borrowed_ptr(py, at.code).unbind();
         let run = Run {
             inputs: inputs.iter().map(|i| Bound::from_borrowed_ptr(py, *i).unbind()).collect(),
             tensors,
@@ -511,7 +514,7 @@ impl Bootstrap {
             fwd_records: 0,
             traced: false,
             forward: None,
-            at: Some((at, code)),
+            at: Some(at),
             site: Ok(Site { checks, tensor_params, outputs: vec![] }),
         };
         Ok(Some((Bootstrap { params: params.to_vec(), inputs, run, copied, tracer: tracer.unbind() }, call)))
@@ -583,11 +586,10 @@ impl Bootstrap {
             // block is untrainable anyway).
             let Some(obj) = Bound::from_borrowed_ptr_or_opt(py, *o) else {
                 news.push(None);
-                let null = self.params.iter().position(|p| p.is_null());
-                templates = templates.zip(null).map(|(mut ts, i)| {
-                    ts.push(Template::Param(i as u32));
-                    ts
-                });
+                let null = self.params.iter().position(|p| p.is_null()).map_or(Template::Null, |i| Template::Param(i as u32));
+                if let Some(ts) = &mut templates {
+                    ts.push(null);
+                }
                 continue;
             };
             let (new, t) = match obj.downcast_exact::<PyTuple>() {

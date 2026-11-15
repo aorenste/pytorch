@@ -109,6 +109,10 @@ impl Table {
         self.0.get(&s).is_some_and(|v| v.varies)
     }
 
+    pub fn retain(&mut self, keep: impl Fn(Site) -> bool) {
+        self.0.retain(|s, _| keep(*s));
+    }
+
     // After the Cfg's blocks were renumbered (`map`: old id -> new id).
     pub fn renumber_blocks(&mut self, map: &[Option<BlockId>]) {
         self.0 = std::mem::take(&mut self.0)
@@ -127,10 +131,24 @@ impl Table {
 // can still be freed: functions, classes and builtins not bound to an object
 // through a weakref, and method descriptors of static types (which can't be
 // weakly referenced) strongly. Holding anything else, like a builtin bound to
-// an object, would keep that object alive. Other calls get no entry.
+// an object, would keep that object alive. Other calls get no entry. For a
+// call of an instance whose class defines __call__ in Python, it's that
+// function; for an attribute load from an instance whose class defines
+// __getattr__ in Python, that function (entered only when the generic lookup
+// missed: see the site's effects).
 pub enum Callee {
-    One { ptr: usize, weak: bool, obj: Py<PyAny> },
+    One { ptr: usize, weak: bool, obj: Py<PyAny>, via: Via },
     Many,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Via {
+    // The callable itself.
+    Callable,
+    // type(callable).__call__.
+    Call,
+    // type(receiver).__getattr__.
+    Getattr,
 }
 
 pub type Callees = IdMap<ValueId, Callee>;
@@ -159,9 +177,25 @@ impl Callee {
             _ => f.repr().map_or_else(|_| "?".into(), |r| r.to_string()),
         }
     }
+
+    pub fn via(&self) -> Option<Via> {
+        match self {
+            Callee::One { via, .. } => Some(*via),
+            Callee::Many => None,
+        }
+    }
+
+    pub fn clone_ref(&self, py: Python<'_>) -> Callee {
+        match self {
+            Callee::One { ptr, weak, obj, via } => Callee::One { ptr: *ptr, weak: *weak, obj: obj.clone_ref(py), via: *via },
+            Callee::Many => Callee::Many,
+        }
+    }
 }
 
-pub unsafe fn record_callee(table: &GilCell<Callees>, v: ValueId, callable: *mut PyObject) {
+// `callable`: what the instr called, or (via Call or Getattr) the function
+// its type runs for it.
+pub unsafe fn record_callee(table: &GilCell<Callees>, v: ValueId, callable: *mut PyObject, via: Via) {
     let f = tr_bound_function(callable);
     let weak = if ffi::PyFunction_Check(f) != 0 || ffi::PyType_Check(f) != 0 {
         true
@@ -186,7 +220,7 @@ pub unsafe fn record_callee(table: &GilCell<Callees>, v: ValueId, callable: *mut
     let table = &mut *table.get();
     match table.get(&v) {
         Some(Callee::Many) => {}
-        Some(c @ Callee::One { ptr, .. }) if *ptr == f as usize && c.get(py).is_some() => {}
+        Some(c @ Callee::One { ptr, via: seen, .. }) if *ptr == f as usize && *seen == via && c.get(py).is_some() => {}
         Some(Callee::One { .. }) => {
             table.insert(v, Callee::Many);
         }
@@ -196,7 +230,7 @@ pub unsafe fn record_callee(table: &GilCell<Callees>, v: ValueId, callable: *mut
                 ffi::PyErr_Clear();
                 return;
             }
-            table.insert(v, Callee::One { ptr: f as usize, weak, obj: Py::from_owned_ptr(py, obj) });
+            table.insert(v, Callee::One { ptr: f as usize, weak, obj: Py::from_owned_ptr(py, obj), via });
         }
     }
 }

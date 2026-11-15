@@ -174,22 +174,30 @@ PyObject* tr_load_global(_PyInterpreterFrame* f, int namei, tr_global_cache* c) 
 // each co_names[attrs[i]] in turn through a module's __dict__ (borrowed), or
 // NULL (no error set) if something isn't there or isn't a plain dict or
 // module. Runs no Python code.
-PyObject* tr_resolve_pin(_PyInterpreterFrame* f, int global, const uint32_t* attrs, Py_ssize_t n) {
-  PyObject* globals = f->f_globals;
-  PyObject* builtins = f->f_builtins;
+// names[0] in globals (NULL: f's), then builtins, then names[1..n] each in
+// the module before's __dict__.
+PyObject* tr_resolve_pin(
+    _PyInterpreterFrame* f,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* const* names,
+    Py_ssize_t n) {
+  if (globals == NULL) {
+    globals = f->f_globals;
+    builtins = f->f_builtins;
+  }
   if (!PyDict_CheckExact(globals) || !PyDict_CheckExact(builtins)) {
     return NULL;
   }
-  PyObject* name = co_name(f, global);
-  PyObject* v = PyDict_GetItemWithError(globals, name);
+  PyObject* v = PyDict_GetItemWithError(globals, names[0]);
   if (v == NULL && !PyErr_Occurred()) {
-    v = PyDict_GetItemWithError(builtins, name);
+    v = PyDict_GetItemWithError(builtins, names[0]);
   }
-  for (Py_ssize_t i = 0; v != NULL && i < n; i++) {
+  for (Py_ssize_t i = 1; v != NULL && i < n; i++) {
     if (!PyModule_CheckExact(v)) {
       return NULL;
     }
-    v = PyDict_GetItemWithError(PyModule_GetDict(v), co_name(f, (int)attrs[i]));
+    v = PyDict_GetItemWithError(PyModule_GetDict(v), names[i]);
   }
   if (v == NULL) {
     PyErr_Clear();
@@ -198,9 +206,9 @@ PyObject* tr_resolve_pin(_PyInterpreterFrame* f, int global, const uint32_t* att
 }
 
 // Method-form LOAD_ATTR: (owner -- meth|NULL, self|attr).
-int tr_load_method(_PyInterpreterFrame* f, int namei, PyObject* owner, PyObject** out) {
+int tr_load_method(PyObject* name, PyObject* owner, PyObject** out) {
   PyObject* meth = NULL;
-  if (_PyObject_GetMethod(owner, co_name(f, namei), &meth)) {
+  if (_PyObject_GetMethod(owner, name, &meth)) {
     out[0] = meth;
     out[1] = Py_NewRef(owner);
     return 0;
@@ -217,6 +225,69 @@ int tr_load_method(_PyInterpreterFrame* f, int namei, PyObject* owner, PyObject*
 // The function a call to `callable` runs, if it's a bound method.
 PyObject* tr_bound_function(PyObject* callable) {
   return PyMethod_Check(callable) ? PyMethod_GET_FUNCTION(callable) : callable;
+}
+
+// The Python function obj's type runs for obj(...) (its __call__) or, with
+// getattr, for an attribute the generic lookup misses (its __getattr__), if
+// obj's type is a class defined in Python and that's a plain function.
+// Borrowed. Runs no Python code.
+PyObject* tr_type_function(PyObject* obj, int getattr) {
+  static PyObject* names[2];
+  if (names[0] == NULL) {
+    names[0] = PyUnicode_InternFromString("__call__");
+    names[1] = PyUnicode_InternFromString("__getattr__");
+    if (names[0] == NULL || names[1] == NULL) {
+      PyErr_Clear();
+      return NULL;
+    }
+  }
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (!PyType_HasFeature(tp, Py_TPFLAGS_HEAPTYPE)) {
+    return NULL;
+  }
+  PyObject* f = _PyType_Lookup(tp, names[getattr ? 1 : 0]);
+  return f != NULL && PyFunction_Check(f) ? f : NULL;
+}
+
+// Whether obj's class runs f for `name` (looked up on the class only).
+int tr_type_attr_is(PyObject* obj, PyObject* name, PyObject* f) {
+  return _PyType_Lookup(Py_TYPE(obj), name) == f;
+}
+
+// Whether loading `name` from obj falls back to its class's __getattr__,
+// which is f: the class has object's __getattribute__ and no attribute by
+// that name, and obj's __dict__ (if any) doesn't have it either. Runs no
+// Python code; 0 with no exception set if not (or on error).
+int tr_getattr_falls_back(PyObject* obj, PyObject* name, PyObject* f) {
+  static PyObject *getattr_name, *getattribute_name, *generic;
+  if (generic == NULL) {
+    getattr_name = PyUnicode_InternFromString("__getattr__");
+    getattribute_name = PyUnicode_InternFromString("__getattribute__");
+    if (getattr_name == NULL || getattribute_name == NULL) {
+      PyErr_Clear();
+      return 0;
+    }
+    generic = _PyType_Lookup(&PyBaseObject_Type, getattribute_name);
+  }
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (_PyType_Lookup(tp, getattr_name) != f || _PyType_Lookup(tp, getattribute_name) != generic ||
+      _PyType_Lookup(tp, name) != NULL) {
+    return 0;
+  }
+  if (tp->tp_dictoffset == 0) {
+    return 1;
+  }
+  PyObject* dict = PyObject_GenericGetDict(obj, NULL);
+  if (dict == NULL) {
+    PyErr_Clear();
+    return 0;
+  }
+  int has = PyDict_Contains(dict, name);
+  Py_DECREF(dict);
+  if (has < 0) {
+    PyErr_Clear();
+  }
+  return has == 0;
 }
 
 PyObject* tr_call(PyObject* const* in, int argc, PyObject* kwnames) {
