@@ -65,9 +65,14 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
             return Err(format!("bb{i}: a guard checks a missing param"));
         }
         for v in &blk.versions {
-            let expects = v.body.iter().any(|x| matches!(cfg[*x].op, Op::Expect(_) | Op::ExpectIs(_) | Op::ExpectCheck(_) | Op::ExpectTypeAttr { .. } | Op::ExpectGetattr { .. }));
-            if (expects || v.restart) && (blk.origin.is_none() || !v.restart) {
-                return Err(format!("bb{i}: a version with Expects or that restarts needs both an origin and restart"));
+            if v.prefix > v.body.len() || (v.prefix > 0 && blk.origin.is_none()) {
+                return Err(format!("bb{i}: a version with a guard prefix needs an origin (and a body that long)"));
+            }
+            if let Some(x) = v.body[..v.prefix].iter().find(|x| !super::inline::is_read(cfg, **x)) {
+                return Err(format!("bb{i}: %{} in a guard prefix doesn't only read", x.0));
+            }
+            if let Some(x) = v.body[v.prefix..].iter().find(|x| super::inline::is_check(&cfg[**x].op)) {
+                return Err(format!("bb{i}: %{} checks after the guard prefix", x.0));
             }
         }
         let n = blk.n_outputs();

@@ -114,10 +114,8 @@ pub struct Prepared {
     pub aten: HashMap<ValueId, (Py<PyAny>, Option<Py<PyTuple>>)>,
     // Cfg::literals as Python objects.
     pub literals: Vec<Py<PyAny>>,
-    // By block: how many times no version's guard held (see _cfg_misses),
-    // and how many times a version that restarts was abandoned.
+    // By block: how many times no version's guard held (see _cfg_misses).
     pub misses: Box<[AtomicU32]>,
-    pub aborts: Box<[AtomicU32]>,
     // By block: whether it may get its own autograd node (see autograd.rs);
     // cleared when it can't, with why.
     pub autograd: Box<[AtomicBool]>,
@@ -180,8 +178,8 @@ impl Prepared {
                 _ => 0,
             } | if ins.op.can_raise() { run::FLAG_RAISE } else { 0 };
         }
-        for v in cfg.blocks.iter().flat_map(|b| &b.versions).filter(|ver| ver.restart).flat_map(|ver| &ver.body) {
-            flags[v.idx()] |= run::FLAG_RESTART;
+        for v in cfg.blocks.iter().flat_map(|b| &b.versions).flat_map(|ver| &ver.body[..ver.prefix]) {
+            flags[v.idx()] |= run::FLAG_PREFIX;
         }
         // A multi-output instr's values are its Projects'.
         for v in body() {
@@ -264,7 +262,6 @@ impl Prepared {
             aten,
             literals,
             misses: (0..cfg_blocks).map(|_| AtomicU32::new(0)).collect(),
-            aborts: (0..cfg_blocks).map(|_| AtomicU32::new(0)).collect(),
             autograd,
             autograd_why: (0..cfg_blocks).map(|_| ffi::GilCell::new(None)).collect(),
             trainings,
@@ -1076,7 +1073,7 @@ impl Elisions<'_> {
                     }
                     Op::Bytecode { opcode: opcodes::BUILD_MAP, arg: 0 } | Op::Bytecode { opcode: opcodes::DICT_MERGE, arg: 1 } => true,
                     Op::LoadAttr(_) | Op::LoadMethod(_) => movable.contains(x) || quiet(*x) || nest(self),
-                    Op::LoadGlobal(_) | Op::Const(_) | Op::Binary(_) | Op::Compare(_) | Op::BuildTuple(_) => movable.contains(x),
+                    Op::LoadGlobal(_) | Op::Const(_) | Op::Binary(_) | Op::Compare(_) | Op::BuildTuple(_) | Op::StoreAttr(_) => movable.contains(x),
                     Op::ToBool | Op::IsNone => movable.contains(x) || quiet(*x),
                     Op::Bytecode { opcode, .. } => {
                         matches!(
@@ -1266,9 +1263,8 @@ pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResul
 /// `code`. Each check is a tuple: ("grad_enabled", bool),
 /// ("requires_grad", param, bool), ("tensor", param, example tensor),
 /// ("value", param, None | bool | int | float), ("no_forward_ad",),
-/// ("no_saved_tensor_hooks",); and, to test restarting, ("restart",) and
-/// ("expect", param, bool) and ("expect_is", param, object) (see
-/// Op::Expect).
+/// ("no_saved_tensor_hooks",); and, to test guard prefixes, ("expect",
+/// param, bool) and ("expect_is", param, object) (see Op::Expect).
 #[pyfunction]
 pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<'_, PyTuple>>) -> PyResult<()> {
     let c = unsafe { lookup(code)? };
@@ -1308,27 +1304,25 @@ pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<
             "value" => Check::Value(param()?, lit(&t.get_item(2)?).ok_or_else(|| bad(t))?),
             "no_forward_ad" => Check::NoForwardAD,
             "no_saved_tensor_hooks" => Check::NoSavedTensorHooks,
-            // Not guard checks: an Expect on a param at the start of the
-            // body, and making the version restart.
-            "expect" | "expect_is" | "restart" => {
+            // Not guard checks: an Expect on a param, at the start of the
+            // guard prefix.
+            "expect" | "expect_is" => {
+                let p = *cfg[b].params.get(param()? as usize).ok_or_else(|| bad(t))?;
+                let origin = cfg[b].versions[0].body.first().map_or(0, |v| cfg[*v].origin);
+                let op = if kind == "expect" {
+                    Op::Expect(t.get_item(2)?.extract()?)
+                } else {
+                    let obj = t.get_item(2)?;
+                    cfg.pins.push(crate::cfg::ir::Pin { name: obj.repr()?.to_string(), path: None });
+                    pins.push(obj.unbind());
+                    Op::ExpectIs(cfg.pins.len() as u32 - 1)
+                };
+                let e = cfg.add(op, vec![p], origin);
                 let ver = &mut cfg[b].versions[0];
-                ver.restart = true;
-                if kind != "restart" {
-                    let p = *cfg[b].params.get(param()? as usize).ok_or_else(|| bad(t))?;
-                    let origin = cfg[b].versions[0].body.first().map_or(0, |v| cfg[*v].origin);
-                    let op = if kind == "expect" {
-                        Op::Expect(t.get_item(2)?.extract()?)
-                    } else {
-                        let obj = t.get_item(2)?;
-                        cfg.pins.push(crate::cfg::ir::Pin { name: obj.repr()?.to_string(), path: None });
-                        pins.push(obj.unbind());
-                        Op::ExpectIs(cfg.pins.len() as u32 - 1)
-                    };
-                    let e = cfg.add(op, vec![p], origin);
-                    cfg[b].versions[0].body.insert(0, e);
-                    for seg in cfg[b].versions[0].unwind.iter_mut().filter(|s| s.from > 0) {
-                        seg.from += 1;
-                    }
+                ver.body.insert(0, e);
+                ver.prefix += 1;
+                for seg in ver.unwind.iter_mut().filter(|s| s.from > 0) {
+                    seg.from += 1;
                 }
                 continue;
             }
@@ -1358,16 +1352,6 @@ pub(crate) fn lit(o: &Bound<'_, PyAny>) -> Option<Lit> {
 /// How many times each block of the CFG the executor runs for `code` found
 /// no version whose guard held (and ran its origin), since the CFG last
 /// changed.
-/// By block of the CFG the executor runs for `code` (or a clone of it, see
-/// cfg_observed): how many times a version that restarts was abandoned for
-/// its origin.
-#[pyfunction]
-#[pyo3(signature = (code, clone=vec![]))]
-pub fn _cfg_aborts(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<u32>> {
-    let c = unsafe { resolve(code, &clone)? };
-    Ok(c.plan().prep.aborts.iter().map(|m| m.load(Ordering::Relaxed)).collect())
-}
-
 #[pyfunction]
 #[pyo3(signature = (code, clone=vec![]))]
 pub fn _cfg_misses(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResult<Vec<u32>> {
@@ -1412,9 +1396,6 @@ fn observed_ops(
     let mut calls: Vec<(ValueId, Py<PyAny>, Option<Option<Vec<Option<Arg>>>>, bool)> = vec![];
     let mut out = HashSet::new();
     let mut nulls = HashSet::new();
-    // Each instr and the torch ops it ran, checked by unrepeatable (which
-    // runs Python code).
-    let mut ran: Vec<(ValueId, Vec<String>)> = vec![];
     {
         let types = unsafe { &*prep.types.get() };
         let effects = unsafe { &*prep.effects.get() };
@@ -1444,18 +1425,6 @@ fn observed_ops(
         let bodies = in_range().flat_map(|b| cfg[*b].versions.first());
         for v in bodies.flat_map(|ver| &ver.body) {
             let ins = &cfg[*v];
-            let ops: Vec<String> = effects
-                .get(Site::Instr(*v))
-                .iter()
-                .flat_map(|(seq, _)| seq.iter())
-                .filter_map(|e| match e {
-                    effects::Effect::TorchOp { op, .. } => Some(op.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !ops.is_empty() {
-                ran.push((*v, ops));
-            }
             let arg = |a: &ValueId| match types[a.idx()].ty.as_ref().and_then(Ty::kinds) {
                 Some(ks) => match ks {
                     [Kind::Tensor(t)] if plain_tensor_types().iter().any(|p| t.class().is(*p as *const _)) => {
@@ -1509,6 +1478,11 @@ fn observed_ops(
                 }
                 op if !op.can_raise() => true,
                 Op::LoadAttr(_) | Op::LoadMethod(_) => no_frames() && plain(&ins.args[0], true),
+                // On plain objects, running no Python code.
+                Op::StoreAttr(_) => {
+                    let objects = matches!(types[ins.args[1].idx()].ty.as_ref().and_then(Ty::kinds), Some(ks) if ks.iter().all(|k| matches!(k, Kind::Object(_))));
+                    no_frames() && objects
+                }
                 Op::Binary(_) | Op::Compare(_) | Op::ToBool | Op::GetIter | Op::Bytecode { .. } => {
                     no_frames() && ins.args.iter().all(|a| plain(a, false))
                 }
@@ -1539,7 +1513,7 @@ fn observed_ops(
     let mut in_graph: HashMap<*mut pyo3::ffi::PyObject, bool> = HashMap::new();
     let mut pinnable = HashMap::new();
     for (v, f, pin, entered) in calls {
-        if entered && !leaf_ops(f.bind(py)).is_some_and(|ops| !ops.iter().any(|op| unrepeatable(py, op))) {
+        if entered && !is_leaf(f.bind(py)) {
             continue;
         }
         if *in_graph.entry(f.as_ptr()).or_insert_with(|| is_in_graph(f.bind(py))) {
@@ -1555,28 +1529,17 @@ fn observed_ops(
             }
         }
     }
-    // A pure block may run again from its start (its origin reruns after a
-    // raise), so nothing in it may have an effect a second run would repeat.
-    for (v, ops) in ran {
-        if ops.iter().any(|op| unrepeatable(py, op)) {
-            out.remove(&v);
-            aten.remove(&v);
-            pinnable.remove(&v);
-        }
-    }
     (out, aten, pinnable, nulls)
 }
 
-// The torch ops a call of Python function `f` was seen to run, if every one
-// ran in f's own frame, which entered no other Python frame and has no
-// writes other than to its own locals: then f is a leaf,
-// which Dynamo's in-graph functions (`F.relu`, `F.layer_norm`) usually are, and
-// a call of it can be treated like a call of a builtin.
-fn leaf_ops(f: &Bound<'_, PyAny>) -> Option<Vec<String>> {
-    let code = f.getattr("__code__").ok()?;
-    let c = unsafe { lookup(&code) }.ok()?;
+// Whether Python function `f` ran its torch ops in its own frame, entering
+// no other Python frame, and writes nothing but its own locals: then f is a
+// leaf, which Dynamo's in-graph functions (`F.relu`, `F.layer_norm`) usually
+// are, and a call of it can be treated like a call of a builtin.
+fn is_leaf(f: &Bound<'_, PyAny>) -> bool {
+    let Ok(code) = f.getattr("__code__") else { return false };
+    let Ok(c) = (unsafe { lookup(&code) }) else { return false };
     let first = unsafe { &*(&*c.plans.lock().unwrap()[0] as *const Plan) };
-    // Writes to anything but its own locals would be repeated by a rerun.
     let writes = first.prep.cfg.instrs.iter().any(|i| match i.op {
         Op::StoreAttr(_) | Op::StoreDeref { .. } | Op::DeleteDeref { .. } => true,
         Op::Bytecode { opcode, .. } => matches!(
@@ -1585,42 +1548,8 @@ fn leaf_ops(f: &Bound<'_, PyAny>) -> Option<Vec<String>> {
         ),
         _ => false,
     });
-    if writes {
-        return None;
-    }
     let effects = unsafe { &*first.prep.effects.get() };
-    let mut ops = vec![];
-    for (seqs, varies) in effects.sites() {
-        if varies {
-            return None;
-        }
-        for e in seqs.iter().flat_map(|(seq, _)| seq) {
-            match e {
-                effects::Effect::TorchOp { op, .. } => ops.push(op.clone()),
-                effects::Effect::Frame { .. } => return None,
-            }
-        }
-    }
-    Some(ops)
-}
-
-// Whether running the op again would be seen: it mutates an argument, or
-// draws random numbers. Unknown ops count as unrepeatable.
-fn unrepeatable(py: Python<'_>, op: &str) -> bool {
-    static CACHE: std::sync::Mutex<Option<HashMap<String, bool>>> = std::sync::Mutex::new(None);
-    if let Some(r) = CACHE.lock().unwrap().get_or_insert_with(HashMap::new).get(op) {
-        return *r;
-    }
-    let r = (|| -> PyResult<bool> {
-        let (ns, rest) = op.split_once("::").unwrap_or(("aten", op));
-        let (name, overload) = rest.split_once('.').unwrap_or((rest, "default"));
-        let f = py.import("torch")?.getattr("ops")?.getattr(ns)?.getattr(name)?.getattr(overload)?;
-        let seeded = py.import("torch")?.getattr("Tag")?.getattr("nondeterministic_seeded")?;
-        Ok(f.getattr("_schema")?.getattr("is_mutable")?.is_truthy()? || f.getattr("tags")?.contains(seeded)?)
-    })()
-    .unwrap_or(true);
-    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(op.to_string(), r);
-    r
+    !writes && effects.sites().all(|(seqs, varies)| !varies && seqs.iter().flat_map(|(seq, _)| seq).all(|e| matches!(e, effects::Effect::TorchOp { .. })))
 }
 
 // Whether `f` is torch._C._has_torch_function{,_unary,_variadic}.

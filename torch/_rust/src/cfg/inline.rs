@@ -3,9 +3,11 @@
 // seen to go, copied into the version of the pure block holding the call.
 // The callee's locals and cells become SSA values, its globals are read from
 // its own namespace, and each branch condition becomes an Expect, as does the
-// callee's identity. The version restarts (Version::restart): an Expect that
-// fails or anything raising runs the block's origin, which makes the real
-// call, so frames, tracebacks and locals stay CPython's.
+// callee's identity. Those checks have to end up in the version's guard
+// prefix (see tidy), so a failing one runs the block's origin, which makes
+// the real call; an elision whose checks depend on what the version computes
+// is refused. A raise in the elided code unwinds from the version as the
+// call would have, without the callee's frame in the traceback.
 //
 // What can be elided: a call (Op::Call, or CALL_FUNCTION_EX of a tuple this
 // elision built and an empty dict) of a function, a bound method or an
@@ -87,13 +89,14 @@ struct Known {
 }
 
 // Elides instr `v` of block p's only version, putting `inl`'s path where it
-// was, and makes the version restart. What was observed of the callee's
+// was (raising into the call's handler, so a path inside a try isn't copied). What was observed of the callee's
 // values is added to `obs` for the instrs they became. Returns, for each
 // callee instr copied (nested ones too), (inlinee id, callee instr, instr),
 // or None (nothing changed) if the path can't be copied after all.
 pub fn elide(cfg: &mut Cfg, p: BlockId, v: ValueId, inl: &Inlinee, obs: &mut Observed) -> Option<Vec<(usize, ValueId, ValueId)>> {
     let body = cfg[p].versions[0].body.clone();
     let at = body.iter().position(|x| *x == v).expect("the instr is in the block");
+    let handlers: HashMap<ValueId, Handler> = body.iter().enumerate().map(|(i, x)| (*x, cfg[p].versions[0].handler_at(i))).collect();
     let origin = cfg[v].origin;
     let a = cfg[v].args.clone();
     let mut out = body[..at].to_vec();
@@ -130,17 +133,25 @@ pub fn elide(cfg: &mut Cfg, p: BlockId, v: ValueId, inl: &Inlinee, obs: &mut Obs
     for o in ver.outputs.iter_mut() {
         *o = get(*o);
     }
-    ver.unwind.clear();
-    ver.restart = true;
+    ver.set_unwind(|x| match handlers.get(&x).unwrap_or(&handlers[&v]) {
+        Handler::Block(k, args) => Handler::Block(*k, args.iter().map(|a| get(*a)).collect()),
+        Handler::Outer(k, args) => Handler::Outer(*k, args.iter().map(|a| get(*a)).collect()),
+        Handler::Propagate => Handler::Propagate,
+    });
     Some(map)
 }
 
 // Tidies block p's version after elisions (and the pinning and aten
 // replacement that follow them): drops values nothing uses that can't
-// raise, and hoists the reads.
-pub fn tidy(cfg: &mut Cfg, p: BlockId) {
+// raise, and hoists the reads into its guard prefix. False if a check is
+// left after the prefix.
+pub fn tidy(cfg: &mut Cfg, p: BlockId) -> bool {
     // Known bools: ToBool of one is itself, and an Expect of it holds (or
     // the version can't run: left for the origin).
+    let handlers: HashMap<ValueId, Handler> = {
+        let ver = &cfg[p].versions[0];
+        ver.body.iter().enumerate().map(|(i, x)| (*x, ver.handler_at(i))).collect()
+    };
     let mut known: HashMap<ValueId, bool> = HashMap::new();
     let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
     let mut kept = vec![];
@@ -205,7 +216,21 @@ pub fn tidy(cfg: &mut Cfg, p: BlockId) {
         body.retain(|v| !dead.contains(v));
     }
     cfg[p].versions[0].body = body;
-    hoist_reads(cfg, p);
+    hoist_reads(cfg, p, |_, _| false);
+    cfg[p].versions[0].set_unwind(|x| handlers[&x].clone());
+    let ok = checks_in_prefix(cfg, p);
+    cfg.normalize_unwind(p);
+    ok
+}
+
+pub fn is_check(op: &Op) -> bool {
+    matches!(op, Op::Expect(_) | Op::ExpectIs(_) | Op::ExpectCheck(_) | Op::ExpectTypeAttr { .. } | Op::ExpectGetattr { .. })
+}
+
+// Whether every check of block p's version is in its guard prefix.
+pub fn checks_in_prefix(cfg: &Cfg, p: BlockId) -> bool {
+    let ver = &cfg[p].versions[0];
+    !ver.body[ver.prefix..].iter().any(|x| is_check(&cfg[*x].op))
 }
 
 // Copies inl's path into `out`; returns the value it returns. `call`: the
@@ -317,6 +342,11 @@ fn splice(
             vals.insert(*p, *x);
         }
         let ver = &blk.versions[0];
+        // A raise in the copy goes to the call's handler, which skips one in
+        // the callee (a try around the path).
+        if ver.unwind.iter().any(|s| s.handler != Handler::Propagate) {
+            return None;
+        }
         for x in &ver.body {
             let ins = &callee[*x];
             let get = |vals: &HashMap<ValueId, ValueId>, a: &ValueId| if a.is_reserved() { Some(*a) } else { vals.get(a).copied() };
@@ -352,6 +382,10 @@ fn splice(
                 Op::LoadMethod(n) => {
                     let n = name(cfg, *n);
                     add(cfg, out, Op::LoadMethod(n), a)
+                }
+                Op::StoreAttr(n) => {
+                    let n = name(cfg, *n);
+                    add(cfg, out, Op::StoreAttr(n), a)
                 }
                 // A projection of an elided LoadMethod: NULL, then the value.
                 Op::Project(k) if inl.nested.contains_key(&ins.args[0]) => {
@@ -418,29 +452,32 @@ fn splice(
 }
 
 // Moves the reads and checks of block p's version that don't depend on what
-// it computes ahead of everything else (in order), as Dynamo checks its
-// guards before running its graph: a check that fails then aborts before
-// any compute ran. Reads move ahead of compute that can't change what they
-// read (aten ops, and calls the version may hold: pinned or in-graph ones).
-fn hoist_reads(cfg: &mut Cfg, p: BlockId) {
+// it computes (or on what `stale` says was written before them) ahead of
+// everything else, in order, and makes them its guard prefix, as Dynamo
+// checks its guards before running its graph: a check that fails then
+// misses before anything else ran. Reads move ahead of compute that can't
+// change what they read (aten ops, and calls the version may hold: pinned or
+// in-graph ones).
+pub fn hoist_reads(cfg: &mut Cfg, p: BlockId, mut stale: impl FnMut(&Cfg, ValueId) -> bool) {
     let body = cfg[p].versions[0].body.clone();
     let mut computed: HashSet<ValueId> = HashSet::new();
     let (mut reads, mut rest) = (vec![], vec![]);
     for x in body {
-        if is_read(cfg, x) && !cfg[x].args.iter().any(|a| computed.contains(a)) {
+        if !stale(cfg, x) && is_read(cfg, x) && !cfg[x].args.iter().any(|a| computed.contains(a)) {
             reads.push(x);
         } else {
             computed.insert(x);
             rest.push(x);
         }
     }
+    let ver = &mut cfg[p].versions[0];
+    ver.prefix = reads.len();
     reads.extend(rest);
-    cfg[p].versions[0].body = reads;
+    ver.body = reads;
 }
 
-// Ops that only read (or check) what they're given and the namespaces they
-// name: in a version that restarts, they make up its read prefix when they
-// come first (see partition::prefix_len). That includes a call of a pinned
+// Ops that only read (or check) what they're given, the namespaces they name
+// and the frame's locals: what a guard prefix may hold. That includes a call of a pinned
 // callee with no args (a predicate like torch._C._is_tracing()).
 pub fn is_read(cfg: &Cfg, v: ValueId) -> bool {
     let ins = &cfg[v];
@@ -450,6 +487,7 @@ pub fn is_read(cfg: &Cfg, v: ValueId) -> bool {
     matches!(
         ins.op,
         Op::Resume
+            | Op::LoadLocal { .. }
             | Op::LoadGlobal(_)
             | Op::LoadGlobalIn { .. }
             | Op::LoadAttr(_)

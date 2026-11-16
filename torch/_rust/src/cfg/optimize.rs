@@ -120,19 +120,49 @@ pub fn optimize_blocks(
         let p = map[p.idx()].expect("a pure block is reachable");
         outline::outline(cfg, &[p], Outline::Merge);
         let calls: Vec<ValueId> = cfg[p].versions[0].body.iter().copied().filter(|v| inlines.contains_key(v)).collect();
+        let nulls = obs.nulls.clone();
+        let is_null = |v: ValueId| v == NULL || nulls.contains(stands_for.get(&v).unwrap_or(&v));
+        // The calls whose elision keeps every check in the guard prefix (see
+        // inline::tidy), found by trying each on a copy.
+        let mut keep: Vec<ValueId> = vec![];
         for v in calls {
-            if let Some(m) = inline::elide(cfg, p, v, &inlines[&v], &mut obs) {
-                elided.extend(m);
+            let mut trial = keep.clone();
+            trial.push(v);
+            let (mut c, mut o) = (cfg.clone(), obs.clone());
+            if finish_block(&mut c, p, &trial, inlines, &mut o, &is_null, &mut vec![], &mut vec![]) {
+                keep.push(v);
             }
         }
-        let is_null = |v: ValueId| v == NULL || obs.nulls.contains(stands_for.get(&v).unwrap_or(&v));
-        pin_calls(cfg, p, &obs.calls, &is_null, pinned);
-        use_aten(cfg, p, &obs.aten, &obs.calls);
-        if cfg[p].versions[0].restart {
-            inline::tidy(cfg, p);
-        }
+        let ok = finish_block(cfg, p, &keep, inlines, &mut obs, &is_null, pinned, elided);
+        debug_assert!(ok, "the elisions kept were tried");
     }
     Ok(map)
+}
+
+// Elides `calls` in pure block p's version, then pins callees and replaces
+// operators; false if a check of an elided callee is left after the guard
+// prefix (it depends on what the version computes).
+#[allow(clippy::too_many_arguments)]
+fn finish_block(
+    cfg: &mut Cfg,
+    p: BlockId,
+    calls: &[ValueId],
+    inlines: &HashMap<ValueId, Inlinee>,
+    obs: &mut Observed,
+    is_null: &dyn Fn(ValueId) -> bool,
+    pinned: &mut Vec<ValueId>,
+    elided: &mut Vec<(usize, ValueId, ValueId)>,
+) -> bool {
+    let mut any = false;
+    for &v in calls {
+        if let Some(m) = inline::elide(cfg, p, v, &inlines[&v], obs) {
+            elided.extend(m);
+            any = true;
+        }
+    }
+    pin_calls(cfg, p, &obs.calls, is_null, pinned);
+    use_aten(cfg, p, &obs.aten, &obs.calls, any);
+    !any || inline::tidy(cfg, p)
 }
 
 // A module's type has only dunder attributes, so any other name is read from
@@ -296,15 +326,14 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
 // guard can make that valid, and adds to the guard. A pinned call returning a
 // plain tensor counts as a replaced op when its args are known as an
 // operator's must be.
-fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &HashMap<ValueId, PinnedCall>) {
+fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &HashMap<ValueId, PinnedCall>, elided: bool) {
     let params = cfg[p].params.clone();
     let body = cfg[p].versions[0].body.clone();
-    let restart = cfg[p].versions[0].restart;
     let mut checks: BTreeSet<Check> = BTreeSet::new();
-    // Values read in the version (a version that restarts can check them
-    // where they're read), and the checks they need.
+    // Values read in a version with elided calls (whose reads become its
+    // guard prefix, see inline::tidy), and the checks they need there.
     let mut read_checks: BTreeSet<(ValueId, Check)> = BTreeSet::new();
-    let is_read = |cfg: &Cfg, x: ValueId| restart && !matches!(cfg[x].op, Op::Param(_) | Op::Const(_) | Op::Pinned(_) | Op::Lit(_)) && inline::is_read(cfg, x);
+    let is_read = |cfg: &Cfg, x: ValueId| elided && !matches!(cfg[x].op, Op::Param(_) | Op::Const(_) | Op::Pinned(_) | Op::Lit(_)) && inline::is_read(cfg, x);
     // Results of replaced ops: plain tensors whenever the guard holds.
     let mut tensors: HashSet<ValueId> = HashSet::new();
     // has_torch_function calls of plain tensors, which are False.
@@ -378,6 +407,8 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
     }
     // Each read's checks right after it.
     if !read_checks.is_empty() {
+        let ver = &cfg[p].versions[0];
+        let handlers: HashMap<ValueId, Handler> = ver.body.iter().enumerate().map(|(i, x)| (*x, ver.handler_at(i))).collect();
         let body = std::mem::take(&mut cfg[p].versions[0].body);
         let mut out = vec![];
         for v in body {
@@ -387,7 +418,9 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
                 out.push(cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![v], origin));
             }
         }
-        cfg[p].versions[0].body = out;
+        let ver = &mut cfg[p].versions[0];
+        ver.body = out;
+        ver.set_unwind(|x| handlers.get(&x).cloned().unwrap_or(Handler::Propagate));
     }
 }
 

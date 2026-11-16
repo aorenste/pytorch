@@ -19,8 +19,7 @@ use super::{Compiled, Prepared};
 enum Exc {
     Error,
     Reraise,
-    // An Expect failed (no exception is set): only in a version that
-    // restarts.
+    // An Expect failed (no exception is set): only in a guard prefix.
     Abort,
 }
 
@@ -243,14 +242,14 @@ enum Next {
     // A raise went to this handler (entered).
     Block(BlockId),
     Done(Outcome),
-    // A version that restarts was abandoned (its values released, no
-    // exception set): run the block's origin.
-    Restart,
+    // The guard prefix missed (the version's values released, no exception
+    // set): run the block's origin.
+    Miss,
 }
 
 pub const FLAG_RAISE: u8 = 1;
-// In a version that restarts (see Version::restart).
-pub const FLAG_RESTART: u8 = 1 << 6;
+// In a version's guard prefix (see Version::prefix).
+pub const FLAG_PREFIX: u8 = 1 << 6;
 // Its own id holds a value (not a multi-output instr's), observed when it's
 // defined.
 pub const FLAG_VALUE: u8 = 2;
@@ -523,9 +522,9 @@ impl Act<'_> {
         } else {
             vers.iter().position(|v| v.guard.checks.iter().all(|c| self.check(b, c)))?
         };
-        // A version that restarts may run its origin on all the params, so
-        // it keeps them (see run_blocks).
-        if !vers[ver].restart {
+        // A version with a guard prefix may run its origin on all the
+        // params, so it keeps them (see run_blocks).
+        if vers[ver].prefix == 0 {
             self.drop_all(&self.p.live.versions[b.idx()][ver].entry_kill);
         }
         Some(ver)
@@ -611,7 +610,7 @@ impl Act<'_> {
 
     // Runs b's origin with its own autograd node (see autograd.rs).
     unsafe fn bootstrap(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
-        let k = crate::cfg::partition::prefix_len(self.cfg, &self.cfg[b].versions[0]);
+        let k = self.cfg[b].versions[0].prefix;
         if k > 0 {
             return self.bootstrap_prefix(b, k);
         }
@@ -629,11 +628,17 @@ impl Act<'_> {
             Ok(None) => self.run_origin(b, params.iter().map(|p| xincref(*p)).collect()),
             Ok(Some((boot, call))) => {
                 let result = super::outside_executor(|| self.run_origin(b, call));
+                let ran = matches!(result, Outcome::Leave(_));
                 match super::outside_executor(|| boot.finish(result)) {
-                    // The traced run raised, maybe only because it was traced
-                    // (a TorchDispatchMode needs the frame's globals to have
-                    // __builtins__): stop bootstrapping b, and run it as
-                    // usual, which raises again if the block itself does.
+                    // The traced run raised: stop bootstrapping b, and let
+                    // the exception go where it went (running the block
+                    // again would repeat what it did before raising).
+                    r @ (Outcome::Error | Outcome::Outer(..)) if !ran => {
+                        self.stop_bootstrapping(b);
+                        r
+                    }
+                    // The block ran but its node couldn't be made: stop
+                    // bootstrapping b, and run it as usual.
                     r @ (Outcome::Error | Outcome::Outer(..)) => {
                         if let Outcome::Outer(_, args) = r {
                             args.into_iter().for_each(|a| ffi::Py_XDECREF(a));
@@ -658,11 +663,25 @@ impl Act<'_> {
         self.after_origin(b, result)
     }
 
-    // Bootstraps block b, whose version has a read prefix of k instrs: runs
+    // After b raised under the tracer: b won't get its own node. The
+    // exception stays set.
+    unsafe fn stop_bootstrapping(&self, b: BlockId) {
+        let py = pyo3::Python::assume_attached();
+        let why = pyo3::PyErr::take(py).map(|e| {
+            let why = e.to_string();
+            e.restore(py);
+            why
+        });
+        self.p.autograd[b.idx()].store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.p.autograd_why[b.idx()].get() = Some(format!("the traced run raised {}", why.as_deref().unwrap_or("?")));
+    }
+
+    // Bootstraps block b, whose version has a guard prefix of k instrs: runs
     // the prefix, then (outside the executor, under the tracer) the rest of
     // the version on the params and the prefix's values, which the node's
     // edges then go to, instead of the origin (which would read them again).
-    // Anything going wrong runs the origin, as the version would.
+    // A miss in the prefix runs the origin, as the version would; a raise in
+    // the rest unwinds from the version.
     unsafe fn bootstrap_prefix(&mut self, b: BlockId, k: usize) -> Result<BlockId, Outcome> {
         let cfg = self.cfg;
         let blk = &cfg[b];
@@ -685,10 +704,14 @@ impl Act<'_> {
         let ids: Vec<ValueId> = blk.params.iter().chain(&carried).copied().collect();
         let args: Vec<*mut PyObject> = ids.iter().map(|x| self.val(*x)).collect();
         let needs = args.iter().any(|o| !o.is_null() && tffi::tensor_by_type(*o as usize).as_ref().is_some_and(|t| t.requires_grad()));
-        // Run the rest; Leave with the outputs, or Error.
-        let run_rest = |this: &mut Self| {
-            for v in &ver.body[k..] {
-                if this.exec(*v, &cfg[*v]).is_err() {
+        // Run the rest; Leave with the outputs, or Error (where it raised,
+        // and how, in `failed`).
+        let mut failed: Option<(usize, Exc)> = None;
+        let mut run_rest = |this: &mut Self| {
+            for (i, v) in ver.body.iter().enumerate().skip(k) {
+                this.set_instr(cfg[*v].origin as c_int);
+                if let Err(how) = this.exec(*v, &cfg[*v]) {
+                    failed = Some((i, how));
                     return Outcome::Error;
                 }
             }
@@ -722,7 +745,12 @@ impl Act<'_> {
                     }
                     let result = super::outside_executor(|| run_rest(self));
                     match super::outside_executor(|| boot.finish(result)) {
-                        // As in bootstrap: stop bootstrapping b, and run it
+                        Outcome::Error if failed.is_some() => {
+                            self.stop_bootstrapping(b);
+                            Outcome::Error
+                        }
+                        // As in bootstrap: the block ran but its node
+                        // couldn't be made; stop bootstrapping b, and run it
                         // as usual.
                         Outcome::Error => {
                             let py = pyo3::Python::assume_attached();
@@ -740,27 +768,31 @@ impl Act<'_> {
                 }
             }
         } else {
-            match run_rest(self) {
-                Outcome::Error => return rerun(self, saved),
-                r => r,
-            }
+            run_rest(self)
         };
         for p in saved {
             ffi::Py_XDECREF(p);
+        }
+        if let Some((i, how)) = failed {
+            return match self.unwind(b, 0, i, how) {
+                Unwound::Block(h) => Ok(h),
+                Unwound::Outer(k, args) => Err(Outcome::Outer(k, args)),
+                Unwound::Propagate => Err(Outcome::Error),
+            };
         }
         self.clear(b, 0);
         self.after_origin(b, result)
     }
 
     // Whether b's block may bootstrap now: its version's guard holds, grad
-    // mode is on and a tensor param requires grad (or, with a read prefix,
+    // mode is on and a tensor param requires grad (or, with a guard prefix,
     // grad mode is on: what the prefix reads is only known after it runs).
     unsafe fn wants_autograd(&self, b: BlockId) -> bool {
         let blk = &self.cfg[b];
         super::autograd::enabled()
             && tffi::grad_mode_enabled()
             && blk.versions[0].guard.checks.iter().all(|c| self.check(b, c))
-            && (crate::cfg::partition::prefix_len(self.cfg, &blk.versions[0]) > 0
+            && (blk.versions[0].prefix > 0
                 || blk.params.iter().any(|p| tffi::tensor_by_type(self.val(*p) as usize).as_ref().is_some_and(|t| t.requires_grad())))
     }
 
@@ -1001,16 +1033,20 @@ impl Act<'_> {
             };
             let ver = &blk.versions[vi];
             let code = &self.p.code[b.idx()][vi];
-            // What its origin runs on if a version that restarts is
-            // abandoned.
-            let mut restart_params: Option<Vec<*mut PyObject>> =
-                (ver.restart && first == 0).then(|| blk.params.iter().map(|p| xincref(self.val(*p))).collect());
-            if restart_params.is_some() {
+            // What its origin runs on if the guard prefix misses.
+            let mut miss_params: Option<Vec<*mut PyObject>> =
+                (ver.prefix > first).then(|| blk.params.iter().map(|p| xincref(self.val(*p))).collect());
+            if miss_params.is_some() {
                 self.drop_all(&self.p.live.versions[b.idx()][vi].entry_kill);
             }
             let fast = self.rec.is_null();
             let mut i = first;
             while i < code.steps.len() {
+                if i == ver.prefix {
+                    for p in miss_params.take().into_iter().flatten() {
+                        ffi::Py_XDECREF(p);
+                    }
+                }
                 // Steps' kill ranges are within `kills`, and instrs index
                 // values within `vals`.
                 let step = code.steps.get_unchecked(i);
@@ -1049,9 +1085,9 @@ impl Act<'_> {
                         continue 'blocks;
                     }
                     Next::Done(outcome) => return outcome,
-                    Next::Restart => {
-                        self.p.aborts[b.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let params = restart_params.take().expect("a version that restarts kept its params");
+                    Next::Miss => {
+                        self.p.misses[b.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let params = miss_params.take().expect("a version with a guard prefix kept its params");
                         let result = self.run_origin(b, params);
                         match self.after_origin(b, result) {
                             Ok(next) => {
@@ -1063,7 +1099,7 @@ impl Act<'_> {
                     }
                 }
             }
-            for p in restart_params.take().into_iter().flatten() {
+            for p in miss_params.take().into_iter().flatten() {
                 ffi::Py_XDECREF(p);
             }
             let edge = match &blk.term {
@@ -1151,14 +1187,16 @@ impl Act<'_> {
             (*rec).set_callee(std::ptr::null_mut());
             (*rec).at(Site::Block(b));
         }
-        let restart = flags & FLAG_RESTART != 0;
-        if let Err(how) = done.and_then(|()| if callee.is_some() && !restart { self.breaker() } else { Ok(()) }) {
-            if restart {
+        // In the guard prefix, no eval breaker after a (pinned predicate)
+        // call: a signal handled there would be lost by a miss.
+        let prefix = flags & FLAG_PREFIX != 0;
+        if let Err(how) = done.and_then(|()| if callee.is_some() && !prefix { self.breaker() } else { Ok(()) }) {
+            if prefix {
                 if how != Exc::Abort {
                     ffi::PyErr_Clear();
                 }
                 self.clear(b, vi);
-                return Next::Restart;
+                return Next::Miss;
             }
             return match self.unwind(b, vi, i, how) {
                 Unwound::Block(h) => Next::Block(h),

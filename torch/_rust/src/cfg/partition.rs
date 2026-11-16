@@ -204,36 +204,14 @@ fn extract(src: &Cfg, params: &[ValueId], body: &[ValueId], outputs: &[ValueId])
     }
     let outs: Vec<ValueId> = outputs.iter().map(|o| get(&map, o)).collect();
     let n = outs.len();
-    blk.versions.push(Version { guard: Guard::default(), body: nbody, outputs: outs, unwind: vec![], restart: false });
+    blk.versions.push(Version { body: nbody, outputs: outs, ..Version::default() });
     blk.term = Terminator::Jump(Exit::Leave((0..n as u32).collect()));
     cfg.boundary = Some(Boundary { n_outputs: n, handler_arity: vec![] });
     cfg.blocks.push(blk);
     cfg
 }
 
-// How many instrs of `ver` are its read prefix: in a version that restarts,
-// the reads and checks hoisted ahead of its compute (see cfg/inline.rs). A
-// training version runs them, then its node's forward on the block's params
-// followed by `carried`.
-pub fn prefix_len(cfg: &Cfg, ver: &Version) -> usize {
-    if !ver.restart {
-        return 0;
-    }
-    let mut seen: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
-    let mut k = 0;
-    for v in &ver.body {
-        let op = &cfg[*v].op;
-        let read = super::inline::is_read(cfg, *v) && (!matches!(op, Op::Project(_)) || seen.contains(&cfg[*v].args[0]));
-        if !read {
-            break;
-        }
-        seen.insert(*v);
-        k += 1;
-    }
-    k
-}
-
-// The values of `ver`'s read prefix (its first k instrs) the rest uses.
+// The values of `ver`'s guard prefix (its first k instrs) the rest uses.
 pub fn carried(cfg: &Cfg, ver: &Version, k: usize) -> Vec<ValueId> {
     let used: std::collections::HashSet<ValueId> = ver.body[k..].iter().flat_map(|v| cfg[*v].args.iter().copied()).chain(ver.outputs.iter().copied()).collect();
     ver.body[..k].iter().copied().filter(|v| used.contains(v)).collect()
@@ -260,9 +238,9 @@ pub fn add_training_version(cfg: &mut Cfg, b: BlockId, checks: Vec<Check>, t: Tr
     let params = blk.params.clone();
     let n = t.outputs.len();
     let origin = first.body.first().map_or(0, |v| cfg[*v].origin);
-    // A copy of the read prefix, whose values the node takes after the
-    // params; checks on those are ExpectChecks.
-    let k = prefix_len(cfg, first);
+    // A copy of the guard prefix, whose values the node takes after the
+    // params; checks on those are ExpectChecks in it.
+    let k = first.prefix;
     let carried = carried(cfg, first, k);
     let prefix: Vec<ValueId> = first.body[..k].to_vec();
     let mut map: HashMap<ValueId, ValueId> = HashMap::new();
@@ -286,8 +264,8 @@ pub fn add_training_version(cfg: &mut Cfg, b: BlockId, checks: Vec<Check>, t: Tr
     let outputs: Vec<ValueId> = (0..n).map(|k| cfg.add(Op::Project(k as u32), vec![v], origin)).collect();
     body.push(v);
     body.extend(outputs.iter().copied());
-    let restart = k > 0;
-    let unwind = if restart { vec![] } else { handler.map(|h| vec![UnwindSegment { from: 0, handler: h }]).unwrap_or_default() };
-    cfg[b].versions.insert(0, Version { guard, body, outputs, unwind, restart });
+    let prefix = body.len() - 1 - n;
+    let unwind = handler.map(|h| vec![UnwindSegment { from: prefix, handler: h }]).unwrap_or_default();
+    cfg[b].versions.insert(0, Version { guard, body, outputs, unwind, prefix });
     Ok(())
 }

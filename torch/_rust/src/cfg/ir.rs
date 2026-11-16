@@ -144,9 +144,8 @@ pub enum Op {
     // guard checks it still does).
     Pinned(u32),
     // Checks that its arg is True (true) or False, and that it is (by
-    // identity) the object Cfg::pins[i]. A failing check aborts the version
-    // (see Version::restart). In-body counterparts of a guard, for values
-    // the version computes.
+    // identity) the object Cfg::pins[i]. Only in a version's guard prefix
+    // (see Version::prefix): checks of what the prefix read.
     Expect(bool),
     ExpectIs(u32),
     // Checks that its arg's class runs Cfg::pins[pin] for Cfg::names[name]
@@ -158,7 +157,7 @@ pub enum Op {
     // instance's __dict__.
     ExpectGetattr { name: u32, pin: u32 },
     // A guard check on its arg instead of a param (the check's param index
-    // is unused): a training version's checks on what its read prefix read.
+    // is unused), on what the guard prefix read.
     ExpectCheck(Box<Check>),
     // Runs Cfg::trainings[i] on the block's params (its args), handing each
     // block output to its Project: the forward of a pure block, with its own
@@ -438,13 +437,31 @@ pub struct Version {
     pub outputs: Vec<ValueId>,
     // Ordered by `from`.
     pub unwind: Vec<UnwindSegment>,
-    // Whether anything going wrong (a raise, a failed Expect) abandons the
-    // version and runs the block's origin from the start instead, which
-    // gives CPython's exact exception, traceback and locals: for a version
-    // with no effects a second run would repeat (see cfg/optimize.rs). Its
-    // unwind segments are unused, and it runs no eval breaker after calls
-    // (a signal handled there would be lost by the abort).
-    pub restart: bool,
+    // The first `prefix` instrs of the body are part of the guard: reads
+    // (see inline::is_read) and the Expect ops checking what they read. A
+    // failed check, or a read raising, there is a miss (the origin runs, and
+    // nothing has to be undone). Nothing after them checks: a raise unwinds
+    // through the version's unwind segments.
+    pub prefix: usize,
+}
+
+impl Version {
+    // The handler a raise at body[i] goes to.
+    pub fn handler_at(&self, i: usize) -> Handler {
+        self.unwind.iter().rev().find(|s| s.from <= i).map_or(Handler::Propagate, |s| s.handler.clone())
+    }
+
+    // Sets the unwind segments from the handler of each instr past the
+    // prefix (raises in the prefix are misses).
+    pub fn set_unwind(&mut self, handler: impl Fn(ValueId) -> Handler) {
+        self.unwind.clear();
+        for (i, v) in self.body.iter().enumerate().skip(self.prefix) {
+            let h = handler(*v);
+            if self.unwind.last().is_none_or(|s| s.handler != h) {
+                self.unwind.push(UnwindSegment { from: i, handler: h });
+            }
+        }
+    }
 }
 
 // Where a raising terminator's exception goes: like a segment's Handler, but
@@ -1172,7 +1189,10 @@ impl<'a> Printer<'a> {
     }
 
     fn body(&self, out: &mut String, ver: &Version, indent: &str) {
-        for v in &ver.body {
+        for (i, v) in ver.body.iter().enumerate() {
+            if i == ver.prefix && i > 0 {
+                let _ = writeln!(out, "{indent}-- guard prefix ends --");
+            }
             let ins = &self.cfg[*v];
             let mut rhs = self.op(&ins.op);
             if !ins.args.is_empty() {
@@ -1274,7 +1294,7 @@ impl<'a> Printer<'a> {
             match blk.versions.as_slice() {
                 // A single unguarded version prints inline, with its outputs
                 // shown as the values they are.
-                [ver] if ver.guard.checks.is_empty() && !ver.restart => {
+                [ver] if ver.guard.checks.is_empty() && ver.prefix == 0 => {
                     self.body(out, ver, &inner);
                     let vals = |o: OutIdx| self.val(ver.outputs[o as usize]);
                     let _ = writeln!(out, "{inner}{}", self.term(blk, &vals));
@@ -1283,8 +1303,7 @@ impl<'a> Printer<'a> {
                 }
                 versions => {
                     for ver in versions {
-                        let restart = if ver.restart { " (restarts)" } else { "" };
-                        let _ = writeln!(out, "{inner}version{}{restart}:", self.guard(blk, &ver.guard));
+                        let _ = writeln!(out, "{inner}version{}:", self.guard(blk, &ver.guard));
                         self.body(out, ver, &deeper);
                         let _ = writeln!(out, "{deeper}outputs [{}]", self.vals(&ver.outputs));
                         self.unwind(out, blk, ver, &deeper);

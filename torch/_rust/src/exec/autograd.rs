@@ -76,7 +76,7 @@ pub fn ineligible(cfg: &Cfg, b: BlockId) -> Option<String> {
             Op::Aten { .. } | Op::Const(_) | Op::Lit(_) | Op::Project(_) | Op::BuildTuple(_) | Op::Resume | Op::Null | Op::Pinned(_)
         ) || pinned_call(v)
     };
-    let compute = &ver.body[crate::cfg::partition::prefix_len(cfg, ver)..];
+    let compute = &ver.body[ver.prefix..];
     if let Some(v) = compute.iter().find(|v| !allowed(**v)) {
         let op = format!("{:?}", cfg[*v].op);
         return Some(format!("runs {}", op.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("?")));
