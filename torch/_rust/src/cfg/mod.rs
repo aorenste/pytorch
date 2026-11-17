@@ -16,6 +16,7 @@ pub mod outline;
 pub mod partition;
 pub mod python;
 pub mod simplify;
+pub mod specialize;
 pub mod verify;
 
 use std::fmt;

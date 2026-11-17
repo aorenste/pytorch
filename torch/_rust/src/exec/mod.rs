@@ -720,6 +720,46 @@ pub fn optimize_block(code: &Bound<'_, PyAny>, block: u32) -> PyResult<()> {
     optimize(code.py(), c, Some(BlockId(block)))
 }
 
+/// Specialize the region of the CFG the executor runs for `code` (of the
+/// clone at `clone`) that starts at block `block`, along the directions its
+/// branches were always seen to go (see cfg/specialize.rs).
+#[pyfunction]
+#[pyo3(signature = (code, block, clone=vec![]))]
+pub fn _specialize(code: &Bound<'_, PyAny>, block: u32, clone: Vec<u32>) -> PyResult<()> {
+    use types::{Kind, Konst, Ty};
+    let c = unsafe { resolve(code, &clone)? };
+    let plan = c.plan();
+    let cfg = &plan.prep.cfg;
+    let types = unsafe { &*plan.prep.types.get() };
+    let mut dirs = HashMap::new();
+    for b in cfg.block_ids() {
+        if let (Terminator::Branch { cond, .. }, Some(ver)) = (&cfg[b].term, cfg[b].versions.first()) {
+            let v = ver.outputs[*cond as usize];
+            if let Some([Kind::Bool(Konst::Is(d))]) = types.get(v.idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
+                dirs.insert(b, *d);
+            }
+        }
+    }
+    // ToBools of a value always seen an exact bool, int or None.
+    let mut exact = HashMap::new();
+    for v in cfg.blocks.iter().filter_map(|b| b.versions.first()).flat_map(|ver| &ver.body) {
+        if !matches!(cfg[*v].op, Op::ToBool) {
+            continue;
+        }
+        let check = match types.get(cfg[*v].args[0].idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
+            Some([Kind::Bool(_)]) => Check::Exact(0, crate::cfg::ir::Builtin::Bool),
+            Some([Kind::Int(_)]) => Check::Exact(0, crate::cfg::ir::Builtin::Int),
+            Some([Kind::None]) => Check::Value(0, Lit::None),
+            _ => continue,
+        };
+        exact.insert(*v, check);
+    }
+    let mut new = (**cfg).clone();
+    let renumbered = crate::cfg::specialize::specialize(&mut new, BlockId(block), &dirs, &exact).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    crate::cfg::verify::verify(&new).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CFG verification failed: {e}")))?;
+    swap_plan(c, plan, plan, new, plan.prep.record, vec![], HashMap::new(), |p| unsafe { &mut *p.effects.get() }.renumber_blocks(&renumbered))
+}
+
 thread_local! {
     // Set while optimizing, which runs Python code (see in_graph) that
     // mustn't be optimized itself meanwhile.

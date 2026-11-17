@@ -2953,6 +2953,127 @@ bb1(%2 s0, %3 s1):
         self.assertEqual(torch._rust.call_with_cfg_execution(f, U()), 2)
         self.assertEqual(torch._rust._cfg_misses(f)[1], 1)
 
+    def test_specialize(self):
+        # A region whose branch went one way becomes one block running the
+        # path taken, with a check on the branch's condition in its guard
+        # prefix (the local a can be read before foo runs); when the check
+        # fails, the block's origin runs the region from its start.
+        log = []
+        ns = {"log": log}
+        exec(
+            "def foo(): log.append('foo')\n"
+            "def bar(): log.append('bar')\n"
+            "def baz(): log.append('baz')\n"
+            "def bay(): log.append('bay')\n"
+            "def f(a):\n    foo()\n    if a:\n        bar()\n    else:\n        baz()\n    bay()\n",
+            ns,
+        )
+        f = ns["f"]
+        torch._rust.call_with_cfg_execution(f, True)
+        torch._rust._specialize(f, 0)
+        self.assertExpectedInline(
+            torch._rust.cfg_observed(f, False, False).split("origin:")[0],
+            """\
+bb0:
+  version:
+    Resume
+    %0 = LoadGlobal foo
+    %1 = LoadLocal a
+    ExpectCheck bool(_) %1
+    %2 = ToBool %1
+    Expect True %2
+    %3 = Const None
+    -- guard prefix ends --
+    %4 = Call 0 null, %0
+    %5 = LoadGlobal bar
+    %6 = Call 0 null, %5
+    %7 = LoadGlobal bay
+    %8 = Call 0 null, %7
+    outputs [%3]
+  return o0
+  """,
+        )
+        for a, want in (
+            (True, ["foo", "bar", "bay"]),
+            (False, ["foo", "baz", "bay"]),
+            (0, ["foo", "baz", "bay"]),
+        ):
+            log.clear()
+            torch._rust.call_with_cfg_execution(f, a)
+            self.assertEqual(log, want)
+        self.assertEqual(torch._rust._cfg_misses(f), [2])
+
+    def test_specialize_shapes(self):
+        # Nested branches joining again, a value passed on the stack across
+        # the branch, and an arm that raises (with CPython's traceback).
+        def g(a, b, n):
+            x = n * 2
+            if a:
+                x += 1
+                if b:
+                    x *= 10
+                else:
+                    x -= 3
+            else:
+                x = -x
+            return x + 100
+
+        def k(a, t):
+            return [t, len("ab")] + [(t * 2 if a else t - 2)]
+
+        def h(a, t):
+            s = t + 1
+            if not a:
+                raise ValueError(f"bad {s}")
+            return s * 2
+
+        for fn, warm, cases in (
+            (g, (True, True, 1), [(True, True, 1), (True, False, 2), (False, True, 3)]),
+            (k, (True, 5), [(True, 5), (False, 5)]),
+            (h, (True, 1), [(True, 1)]),
+        ):
+            torch._rust.call_with_cfg_execution(fn, *warm)
+            torch._rust._specialize(fn, 0)
+            shown = torch._rust.cfg_observed(fn, False, False)
+            self.assertIn("-- guard prefix ends --", shown)
+            for args in cases:
+                self.assertEqual(
+                    torch._rust.call_with_cfg_execution(fn, *args), fn(*args)
+                )
+        self.assertEqual(torch._rust._cfg_misses(g)[0], 2)
+        self.assertEqual(torch._rust._cfg_misses(k)[0], 1)
+        try:
+            torch._rust.call_with_cfg_execution(h, False, 2)
+            self.fail("no exception")
+        except ValueError as e:
+            self.assertEqual(str(e), "bad 3")
+            tb = traceback.extract_tb(e.__traceback__)
+        self.assertEqual(tb[-1].line, 'raise ValueError(f"bad {s}")')
+
+    def test_specialize_refused(self):
+        # A branch seen going both ways isn't specialized, nor one whose
+        # condition is only known after code that can run Python.
+        def f(a):
+            if a:
+                return 1
+            return 2
+
+        def g(t):
+            if t.ready():
+                return 1
+            return 2
+
+        class T:
+            def ready(self):
+                return True
+
+        torch._rust.call_with_cfg_execution(f, True)
+        torch._rust.call_with_cfg_execution(f, False)
+        torch._rust.call_with_cfg_execution(g, T())
+        for fn in (f, g):
+            with self.assertRaisesRegex(ValueError, "seen going one way"):
+                torch._rust._specialize(fn, 0)
+
     def test_elide_stores(self):
         # Attribute stores are elided like the rest; a raise after them leaves
         # them done, as CPython does.

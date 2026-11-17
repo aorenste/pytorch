@@ -74,6 +74,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(exec::_set_cfg_record, m)?)?;
     m.add_function(wrap_pyfunction!(exec::cfg_observed, m)?)?;
     m.add_function(wrap_pyfunction!(exec::optimize_block, m)?)?;
+    m.add_function(wrap_pyfunction!(exec::_specialize, m)?)?;
     m.add_function(wrap_pyfunction!(exec::_reoptimize, m)?)?;
     m.add_function(wrap_pyfunction!(exec::_cfg_clones, m)?)?;
     m.add_function(wrap_pyfunction!(exec::_set_cfg_elide, m)?)?;
