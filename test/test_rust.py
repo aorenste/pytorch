@@ -3003,6 +3003,37 @@ bb0:
             self.assertEqual(log, want)
         self.assertEqual(torch._rust._cfg_misses(f), [2])
 
+    def test_specialize_compare(self):
+        # A compare of values always seen exact builtins (each checked) runs
+        # no Python code, so it moves ahead of foo into the guard prefix.
+        log = []
+        ns = {"log": log}
+        exec(
+            "def foo(): log.append('foo')\n"
+            "def bar(): log.append('bar')\n"
+            "def baz(): log.append('baz')\n"
+            "def f(n, s):\n    foo()\n    if n == 3 and s != 'x':\n        bar()\n    else:\n        baz()\n",
+            ns,
+        )
+        f = ns["f"]
+        torch._rust.call_with_cfg_execution(f, 3, "y")
+        torch._rust._specialize(f, 0)
+        out = torch._rust.cfg_observed(f, False, False).split("origin:")[0]
+        prefix = out.split("-- guard prefix ends --")[0]
+        self.assertIn("ExpectCheck int(_)", prefix)
+        self.assertIn("ExpectCheck str(_)", prefix)
+        self.assertEqual(prefix.count("CompareOp"), 2)
+        for args, want in (
+            ((3, "y"), ["foo", "bar"]),
+            ((4, "y"), ["foo", "baz"]),
+            ((3, "x"), ["foo", "baz"]),
+            ((3.0, "y"), ["foo", "bar"]),
+        ):
+            log.clear()
+            torch._rust.call_with_cfg_execution(f, *args)
+            self.assertEqual(log, want)
+        self.assertEqual(torch._rust._cfg_misses(f), [3])
+
     def test_specialize_shapes(self):
         # Nested branches joining again, a value passed on the stack across
         # the branch, and an arm that raises (with CPython's traceback).
@@ -3153,6 +3184,47 @@ bb0:
             h.remove()
             lin.forward = lambda t: t[:, :3]
             self.assertEqual(torch._rust.call_with_cfg_execution(f, x), x[:, :3] * 2)
+            self.assertEqual(torch._rust._cfg_misses(f)[1], misses + 1)
+        finally:
+            torch._rust._set_cfg_optimize(False)
+            torch._rust._set_cfg_elide(False)
+            torch._rust._set_cfg_autograd(False)
+
+    def test_elide_config_branch(self):
+        # A branch on Python config (a compare of attribute reads) is checked
+        # in the guard prefix, so the module call is elided and trains; when
+        # the config changes, the check fails and the real call runs.
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = torch.nn.Linear(4, 4)
+                self.act = "relu"
+
+            def forward(self, x):
+                y = self.fc(x)
+                if self.act == "relu":
+                    return F.relu(y)
+                return F.gelu(y)
+
+        m = M()
+
+        def f(x):
+            return m(x)
+
+        x = torch.randn(2, 4)
+        torch._rust._set_cfg_optimize(True)
+        torch._rust._set_cfg_elide(True)
+        torch._rust._set_cfg_autograd(True)
+        try:
+            for _ in range(15):
+                torch._rust.call_with_cfg_execution(f, x).sum().backward()
+            self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
+            out = torch._rust.cfg_observed(f, False, False)
+            prefix = out.split("-- guard prefix ends --")[0]
+            self.assertIn("CompareOp ==", prefix)
+            misses = torch._rust._cfg_misses(f)[1]
+            m.act = "gelu"
+            self.assertEqual(torch._rust.call_with_cfg_execution(f, x), F.gelu(m.fc(x)))
             self.assertEqual(torch._rust._cfg_misses(f)[1], misses + 1)
         finally:
             torch._rust._set_cfg_optimize(False)

@@ -503,6 +503,7 @@ pub fn is_read(cfg: &Cfg, v: ValueId) -> bool {
             | Op::ExpectGetattr { .. }
             | Op::IsNone
             | Op::ToBool
+            | Op::Compare(_)
             | Op::BuildTuple(_)
             | Op::Bytecode {
                 opcode: opcodes::CONTAINS_OP | opcodes::BINARY_SUBSCR | opcodes::IS_OP | opcodes::BUILD_MAP,

@@ -19,9 +19,9 @@ use super::outline::outlinable;
 // Specializes the region starting at `head` along the directions `dirs` its
 // branches were seen to go, extending the path as far as it stays a region.
 // Returns each old block's new id (blocks are renumbered).
-// `exact`: for a ToBool, a check on its arg (an exact builtin type) under
-// which it runs no Python code, so it may move ahead of calls.
-pub fn specialize(cfg: &mut Cfg, head: BlockId, dirs: &HashMap<BlockId, bool>, exact: &HashMap<ValueId, Check>) -> Result<Vec<Option<BlockId>>, String> {
+// `exact`: for a ToBool or Compare, a check on each arg (an exact builtin
+// type) under which it runs no Python code, so it may move ahead of calls.
+pub fn specialize(cfg: &mut Cfg, head: BlockId, dirs: &HashMap<BlockId, bool>, exact: &HashMap<ValueId, Vec<Check>>) -> Result<Vec<Option<BlockId>>, String> {
     if head.idx() >= cfg.blocks.len() || !outlinable(cfg, head) {
         return Err(format!("bb{} can't be specialized: it already has an origin or several versions, or a generator suspends in it", head.0));
     }
@@ -144,7 +144,7 @@ fn leave(cfg: &Cfg, x: BlockId, e: &Exit) -> Exit {
 
 // Whether it built the region (false: a check didn't make it into the guard
 // prefix).
-fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<BlockId, bool>, exact: &HashMap<ValueId, Check>) -> bool {
+fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<BlockId, bool>, exact: &HashMap<ValueId, Vec<Check>>) -> bool {
     let head = path[0];
     let x = *path.last().unwrap();
     let mut handlers: Vec<BlockId> = vec![];
@@ -161,7 +161,7 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
 
     // The merged version: the path's bodies in order, each block's params
     // replaced by what the previous one passes, a check at each branch (and
-    // before a ToBool `exact` has a check for). Each instr's handler, by
+    // before a ToBool or Compare `exact` has checks for). Each instr's handler, by
     // instr.
     let mut merged = Version::default();
     let mut raises_to: HashMap<ValueId, Handler> = HashMap::new();
@@ -173,8 +173,8 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
         for (k, v) in ver.body.iter().enumerate() {
             let args: Vec<ValueId> = cfg[*v].args.iter().map(|a| get(&subst, *a)).collect();
             cfg[*v].args = args.clone();
-            if let Some(c) = exact.get(v) {
-                let check = cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![args[0]], cfg[*v].origin);
+            for (c, a) in exact.get(v).into_iter().flatten().zip(&args) {
+                let check = cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![*a], cfg[*v].origin);
                 merged.body.push(check);
             }
             let handler = match ver.handler_at(k) {
@@ -240,7 +240,7 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
     super::inline::hoist_reads(cfg, head, |cfg, x| {
         let stale = match cfg[x].op {
             Op::LoadLocal { slot } => all_written || written.contains(&slot),
-            Op::ToBool => opaque && !exact.contains_key(&x),
+            Op::ToBool | Op::Compare(_) => opaque && !exact.contains_key(&x),
             Op::LoadGlobal(_) | Op::LoadGlobalIn { .. } | Op::LoadAttr(_) | Op::LoadMethod(_) | Op::Call { .. } | Op::Bytecode { .. } | Op::Resume => opaque,
             _ => false,
         };

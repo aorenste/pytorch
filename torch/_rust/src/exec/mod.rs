@@ -726,6 +726,7 @@ pub fn optimize_block(code: &Bound<'_, PyAny>, block: u32) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (code, block, clone=vec![]))]
 pub fn _specialize(code: &Bound<'_, PyAny>, block: u32, clone: Vec<u32>) -> PyResult<()> {
+    use crate::cfg::ir::Builtin;
     use types::{Kind, Konst, Ty};
     let c = unsafe { resolve(code, &clone)? };
     let plan = c.plan();
@@ -740,19 +741,23 @@ pub fn _specialize(code: &Bound<'_, PyAny>, block: u32, clone: Vec<u32>) -> PyRe
             }
         }
     }
-    // ToBools of a value always seen an exact bool, int or None.
+    // ToBools and Compares of values always seen an exact bool, int, float,
+    // str or None.
+    let exact_check = |v: ValueId| match types.get(v.idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
+        Some([Kind::Bool(_)]) => Some(Check::Exact(0, Builtin::Bool)),
+        Some([Kind::Int(_)]) => Some(Check::Exact(0, Builtin::Int)),
+        Some([Kind::Float]) => Some(Check::Exact(0, Builtin::Float)),
+        Some([Kind::Str(_)]) => Some(Check::Exact(0, Builtin::Str)),
+        Some([Kind::None]) => Some(Check::Value(0, Lit::None)),
+        _ => None,
+    };
     let mut exact = HashMap::new();
     for v in cfg.blocks.iter().filter_map(|b| b.versions.first()).flat_map(|ver| &ver.body) {
-        if !matches!(cfg[*v].op, Op::ToBool) {
-            continue;
+        if matches!(cfg[*v].op, Op::ToBool | Op::Compare(_)) {
+            if let Some(checks) = cfg[*v].args.iter().map(|a| exact_check(*a)).collect::<Option<Vec<_>>>() {
+                exact.insert(*v, checks);
+            }
         }
-        let check = match types.get(cfg[*v].args[0].idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
-            Some([Kind::Bool(_)]) => Check::Exact(0, crate::cfg::ir::Builtin::Bool),
-            Some([Kind::Int(_)]) => Check::Exact(0, crate::cfg::ir::Builtin::Int),
-            Some([Kind::None]) => Check::Value(0, Lit::None),
-            _ => continue,
-        };
-        exact.insert(*v, check);
     }
     let mut new = (**cfg).clone();
     let renumbered = crate::cfg::specialize::specialize(&mut new, BlockId(block), &dirs, &exact).map_err(pyo3::exceptions::PyValueError::new_err)?;

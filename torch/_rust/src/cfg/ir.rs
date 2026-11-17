@@ -420,6 +420,7 @@ pub enum Builtin {
     Int,
     Float,
     Bool,
+    Str,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]

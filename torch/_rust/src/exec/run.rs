@@ -546,6 +546,7 @@ impl Act<'_> {
                     Builtin::Int => &raw mut ffi::PyLong_Type,
                     Builtin::Float => &raw mut ffi::PyFloat_Type,
                     Builtin::Bool => &raw mut ffi::PyBool_Type,
+                    Builtin::Str => &raw mut ffi::PyUnicode_Type,
                 }
             }
             Check::NoTorchFunctionMode => !tffi::torch_function_mode_active(),
