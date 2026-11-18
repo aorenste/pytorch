@@ -211,17 +211,12 @@ fn extract(src: &Cfg, params: &[ValueId], body: &[ValueId], outputs: &[ValueId])
     cfg
 }
 
-// The values of `ver`'s guard prefix (its first k instrs) the rest uses.
-pub fn carried(cfg: &Cfg, ver: &Version, k: usize) -> Vec<ValueId> {
-    let used: std::collections::HashSet<ValueId> = ver.body[k..].iter().flat_map(|v| cfg[*v].args.iter().copied()).chain(ver.outputs.iter().copied()).collect();
-    ver.body[..k].iter().copied().filter(|v| used.contains(v)).collect()
-}
-
 // Puts a version running `t` with its own autograd node before b's others,
-// guarded by b's first version's checks and `checks`. Its exceptions go
+// guarded by b's first version's checks and `checks` (each on the node's arg
+// at that position, or global). Its exceptions go
 // where b's first version's do; that has to be one handler taking only b's
 // params (the training version has no other values).
-pub fn add_training_version(cfg: &mut Cfg, b: BlockId, checks: Vec<Check>, t: Training) -> Result<(), String> {
+pub fn add_training_version(cfg: &mut Cfg, b: BlockId, checks: Vec<(Option<u32>, Check)>, t: Training) -> Result<(), String> {
     let blk = &cfg[b];
     let first = &blk.versions[0];
     let mut handlers = first.unwind.iter().map(|s| &s.handler);
@@ -238,34 +233,17 @@ pub fn add_training_version(cfg: &mut Cfg, b: BlockId, checks: Vec<Check>, t: Tr
     let params = blk.params.clone();
     let n = t.outputs.len();
     let origin = first.body.first().map_or(0, |v| cfg[*v].origin);
-    // A copy of the guard prefix, whose values the node takes after the
-    // params; checks on those are ExpectChecks in it.
-    let k = first.prefix;
-    let carried = carried(cfg, first, k);
-    let prefix: Vec<ValueId> = first.body[..k].to_vec();
-    let mut map: HashMap<ValueId, ValueId> = HashMap::new();
-    let mut body = vec![];
-    for v in prefix {
-        let ins = cfg[v].clone();
-        let args = ins.args.iter().map(|a| *map.get(a).unwrap_or(a)).collect();
-        let nv = cfg.add(ins.op, args, ins.origin);
-        map.insert(v, nv);
-        body.push(nv);
-    }
-    let args: Vec<ValueId> = params.iter().copied().chain(carried.iter().map(|c| map[c])).collect();
-    for c in checks {
-        match c.param() {
-            Some(i) if i as usize >= params.len() => body.push(cfg.add(Op::ExpectCheck(Box::new(c)), vec![args[i as usize]], origin)),
-            _ => guard.checks.push(c),
-        }
-    }
+    // The node takes the params, then the reads the first version takes;
+    // `checks` name them by that position.
+    let inputs = first.inputs.clone();
+    let args: Vec<ValueId> = params.iter().chain(&inputs).copied().collect();
+    guard.checks.extend(checks.into_iter().map(|(i, c)| (i.map(|i| args[i as usize]), c)));
     cfg.trainings.push(std::sync::Arc::new(t));
     let v = cfg.add(Op::Autograd(cfg.trainings.len() as u32 - 1), args, origin);
     let outputs: Vec<ValueId> = (0..n).map(|k| cfg.add(Op::Project(k as u32), vec![v], origin)).collect();
-    body.push(v);
+    let mut body = vec![v];
     body.extend(outputs.iter().copied());
-    let prefix = body.len() - 1 - n;
-    let unwind = handler.map(|h| vec![UnwindSegment { from: prefix, handler: h }]).unwrap_or_default();
-    cfg[b].versions.insert(0, Version { guard, body, outputs, unwind, prefix });
+    let unwind = handler.map(|h| vec![UnwindSegment { from: 0, handler: h }]).unwrap_or_default();
+    cfg[b].versions.insert(0, Version { guard, body, outputs, unwind, inputs });
     Ok(())
 }

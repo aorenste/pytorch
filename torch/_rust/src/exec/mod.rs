@@ -92,6 +92,8 @@ pub struct Prepared {
     // For an instr with several outputs, the Project instr receiving each
     // (by output position).
     pub projects: Vec<Vec<Option<ValueId>>>,
+    // For each of a block's reads (Block::reads), its position there.
+    pub read_pos: Vec<u32>,
     // Number of new outputs of each Op::Bytecode instr.
     pub nouts: Vec<u32>,
     // By block, then version: the body as run_blocks steps through it.
@@ -151,7 +153,13 @@ impl Prepared {
         let mut projects: Vec<Vec<Option<ValueId>>> = vec![vec![]; n];
         let mut nouts = vec![0u32; n];
         let mut flags = vec![0u8; n];
-        let body = || cfg.blocks.iter().flat_map(|b| &b.versions).flat_map(|ver| &ver.body);
+        let mut read_pos = vec![u32::MAX; n];
+        for b in &cfg.blocks {
+            for (i, r) in b.reads.iter().enumerate() {
+                read_pos[r.idx()] = i as u32;
+            }
+        }
+        let body = || cfg.blocks.iter().flat_map(|b| b.reads.iter().chain(b.versions.iter().flat_map(|ver| &ver.body)));
         for v in body() {
             let ins = &cfg[*v];
             match &ins.op {
@@ -177,9 +185,6 @@ impl Prepared {
                 } => run::FLAG_CALL_EX,
                 _ => 0,
             } | if ins.op.can_raise() { run::FLAG_RAISE } else { 0 };
-        }
-        for v in cfg.blocks.iter().flat_map(|b| &b.versions).flat_map(|ver| &ver.body[..ver.prefix]) {
-            flags[v.idx()] |= run::FLAG_PREFIX;
         }
         // A multi-output instr's values are its Projects'.
         for v in body() {
@@ -250,6 +255,7 @@ impl Prepared {
         Ok(Prepared {
             cfg,
             projects,
+            read_pos,
             nouts,
             code,
             globals,
@@ -744,16 +750,20 @@ pub fn _specialize(code: &Bound<'_, PyAny>, block: u32, clone: Vec<u32>) -> PyRe
     // ToBools and Compares of values always seen an exact bool, int, float,
     // str or None.
     let exact_check = |v: ValueId| match types.get(v.idx()).and_then(|s| s.ty.as_ref()).and_then(Ty::kinds) {
-        Some([Kind::Bool(_)]) => Some(Check::Exact(0, Builtin::Bool)),
-        Some([Kind::Int(_)]) => Some(Check::Exact(0, Builtin::Int)),
-        Some([Kind::Float]) => Some(Check::Exact(0, Builtin::Float)),
-        Some([Kind::Str(_)]) => Some(Check::Exact(0, Builtin::Str)),
-        Some([Kind::None]) => Some(Check::Value(0, Lit::None)),
+        Some([Kind::Bool(_)]) => Some(Check::Exact(Builtin::Bool)),
+        Some([Kind::Int(_)]) => Some(Check::Exact(Builtin::Int)),
+        Some([Kind::Float]) => Some(Check::Exact(Builtin::Float)),
+        Some([Kind::Str(_)]) => Some(Check::Exact(Builtin::Str)),
+        Some([Kind::None]) => Some(Check::Value(Lit::None)),
         _ => None,
     };
     let mut exact = HashMap::new();
     for v in cfg.blocks.iter().filter_map(|b| b.versions.first()).flat_map(|ver| &ver.body) {
-        if matches!(cfg[*v].op, Op::ToBool | Op::Compare(_)) {
+        // A compare of exact builtins is a bool.
+        let compare_of_exact = |a: ValueId| matches!(cfg[a].op, Op::Compare(_)) && cfg[a].args.iter().all(|x| exact_check(*x).is_some());
+        if matches!(cfg[*v].op, Op::ToBool) && compare_of_exact(cfg[*v].args[0]) {
+            exact.insert(*v, vec![]);
+        } else if matches!(cfg[*v].op, Op::ToBool | Op::Compare(_)) {
             if let Some(checks) = cfg[*v].args.iter().map(|a| exact_check(*a)).collect::<Option<Vec<_>>>() {
                 exact.insert(*v, checks);
             }
@@ -915,7 +925,13 @@ struct Elisions<'a> {
 }
 
 impl Elisions<'_> {
+    // An object pinned before (by identity) keeps its pin, so reads of it
+    // are the same read (see cfg/guard.rs).
     fn pin(&mut self, name: String, obj: Bound<'_, PyAny>) -> u32 {
+        let base = self.cfg.pins.len() - self.pins.len();
+        if let Some(k) = self.pins.iter().position(|p| p.is(&obj)) {
+            return (base + k) as u32;
+        }
         self.cfg.pins.push(crate::cfg::ir::Pin { name, path: None });
         self.pins.push(obj.unbind());
         self.cfg.pins.len() as u32 - 1
@@ -1241,7 +1257,7 @@ fn swap_plan(
 
 // Gives block b of code's Cfg a version running `t` (see autograd.rs), if
 // the Cfg is still the one whose Prepared is at `prep`.
-pub(crate) fn add_training(c: &Compiled, prep: usize, b: BlockId, checks: Vec<Check>, t: Training) -> PyResult<()> {
+pub(crate) fn add_training(c: &Compiled, prep: usize, b: BlockId, checks: Vec<(Option<u32>, Check)>, t: Training) -> PyResult<()> {
     let plan = c.plan();
     if &plan.prep as *const Prepared as usize != prep {
         return Err(pyo3::exceptions::PyRuntimeError::new_err("the CFG changed since the block ran"));
@@ -1308,8 +1324,8 @@ pub fn _cfg_autograd_blocks(code: &Bound<'_, PyAny>, clone: Vec<u32>) -> PyResul
 /// `code`. Each check is a tuple: ("grad_enabled", bool),
 /// ("requires_grad", param, bool), ("tensor", param, example tensor),
 /// ("value", param, None | bool | int | float), ("no_forward_ad",),
-/// ("no_saved_tensor_hooks",); and, to test guard prefixes, ("expect",
-/// param, bool) and ("expect_is", param, object) (see Op::Expect).
+/// ("no_saved_tensor_hooks",), ("expect", param, bool) (the param is True
+/// or False) and ("expect_is", param, object).
 #[pyfunction]
 pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<'_, PyTuple>>) -> PyResult<()> {
     let c = unsafe { lookup(code)? };
@@ -1323,10 +1339,14 @@ pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<
     let bad = |c: &Bound<'_, PyTuple>| pyo3::exceptions::PyValueError::new_err(format!("bad check {c}"));
     for t in &checks {
         let kind: String = t.get_item(0)?.extract()?;
-        let param = || -> PyResult<u32> { t.get_item(1)?.extract() };
+        let params = cfg[b].params.clone();
+        let param = || -> PyResult<Option<ValueId>> {
+            let i: usize = t.get_item(1)?.extract()?;
+            params.get(i).copied().map(Some).ok_or_else(|| bad(t))
+        };
         let check = match kind.as_str() {
-            "grad_enabled" => Check::GradEnabled(t.get_item(1)?.extract()?),
-            "requires_grad" => Check::RequiresGrad(param()?, t.get_item(2)?.extract()?),
+            "grad_enabled" => (None, Check::GradEnabled(t.get_item(1)?.extract()?)),
+            "requires_grad" => (param()?, Check::RequiresGrad(t.get_item(2)?.extract()?)),
             "tensor" => {
                 let x = t.get_item(2)?;
                 let tensor: &crate::bindings::ffi::Tensor = x.extract()?;
@@ -1335,41 +1355,24 @@ pub fn _add_block_checks(code: &Bound<'_, PyAny>, block: u32, checks: Vec<Bound<
                 if !m.strided {
                     return Err(pyo3::exceptions::PyValueError::new_err("a tensor check needs a strided tensor"));
                 }
-                Check::TensorMeta(
-                    param()?,
-                    Box::new(TensorSpec {
-                        dtype: m.dtype,
-                        device_type: m.device_type,
-                        device_index: m.device_index,
-                        sizes: tensor.sizes().to_vec(),
-                        strides: tensor.strides().to_vec(),
-                    }),
-                )
-            }
-            "value" => Check::Value(param()?, lit(&t.get_item(2)?).ok_or_else(|| bad(t))?),
-            "no_forward_ad" => Check::NoForwardAD,
-            "no_saved_tensor_hooks" => Check::NoSavedTensorHooks,
-            // Not guard checks: an Expect on a param, at the start of the
-            // guard prefix.
-            "expect" | "expect_is" => {
-                let p = *cfg[b].params.get(param()? as usize).ok_or_else(|| bad(t))?;
-                let origin = cfg[b].versions[0].body.first().map_or(0, |v| cfg[*v].origin);
-                let op = if kind == "expect" {
-                    Op::Expect(t.get_item(2)?.extract()?)
-                } else {
-                    let obj = t.get_item(2)?;
-                    cfg.pins.push(crate::cfg::ir::Pin { name: obj.repr()?.to_string(), path: None });
-                    pins.push(obj.unbind());
-                    Op::ExpectIs(cfg.pins.len() as u32 - 1)
+                let spec = TensorSpec {
+                    dtype: m.dtype,
+                    device_type: m.device_type,
+                    device_index: m.device_index,
+                    sizes: tensor.sizes().to_vec(),
+                    strides: tensor.strides().to_vec(),
                 };
-                let e = cfg.add(op, vec![p], origin);
-                let ver = &mut cfg[b].versions[0];
-                ver.body.insert(0, e);
-                ver.prefix += 1;
-                for seg in ver.unwind.iter_mut().filter(|s| s.from > 0) {
-                    seg.from += 1;
-                }
-                continue;
+                (param()?, Check::TensorMeta(Box::new(spec)))
+            }
+            "value" => (param()?, Check::Value(lit(&t.get_item(2)?).ok_or_else(|| bad(t))?)),
+            "no_forward_ad" => (None, Check::NoForwardAD),
+            "no_saved_tensor_hooks" => (None, Check::NoSavedTensorHooks),
+            "expect" => (param()?, Check::Value(Lit::Bool(t.get_item(2)?.extract()?))),
+            "expect_is" => {
+                let obj = t.get_item(2)?;
+                cfg.pins.push(crate::cfg::ir::Pin { name: obj.repr()?.to_string(), path: None });
+                pins.push(obj.unbind());
+                (param()?, Check::Is(cfg.pins.len() as u32 - 1))
             }
             _ => return Err(bad(t)),
         };

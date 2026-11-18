@@ -41,7 +41,6 @@ extern "C" {
     pub fn tr_unbound_local(f: *mut Frame, slot: c_int);
     pub fn tr_unbound_deref(f: *mut Frame, slot: c_int);
     pub fn tr_load_global(f: *mut Frame, namei: c_int, cache: *mut GlobalCache) -> *mut PyObject;
-    pub fn tr_resolve_pin(f: *mut Frame, globals: *mut PyObject, builtins: *mut PyObject, names: *const *mut PyObject, n: isize) -> *mut PyObject;
     pub fn tr_load_method(name: *mut PyObject, owner: *mut PyObject, out: *mut *mut PyObject) -> c_int;
     pub fn tr_bound_function(callable: *mut PyObject) -> *mut PyObject;
     pub fn tr_type_function(obj: *mut PyObject, getattr: c_int) -> *mut PyObject;

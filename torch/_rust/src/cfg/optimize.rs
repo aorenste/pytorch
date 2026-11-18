@@ -32,7 +32,7 @@
 // tracer sees the aten ops below them), but a callee read from a global
 // through module attributes (`F.linear`, `torch.relu`) is pinned: the version
 // calls the object those loads produced when it was optimized, and its guard
-// checks the loads would still produce it.
+// reads them and checks they still produce it (see cfg/guard.rs).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -122,8 +122,8 @@ pub fn optimize_blocks(
         let calls: Vec<ValueId> = cfg[p].versions[0].body.iter().copied().filter(|v| inlines.contains_key(v)).collect();
         let nulls = obs.nulls.clone();
         let is_null = |v: ValueId| v == NULL || nulls.contains(stands_for.get(&v).unwrap_or(&v));
-        // The calls whose elision keeps every check in the guard prefix (see
-        // inline::tidy), found by trying each on a copy.
+        // The calls whose elision keeps every check in the guard (see
+        // cfg/guard.rs), found by trying each on a copy.
         let mut keep: Vec<ValueId> = vec![];
         for v in calls {
             let mut trial = keep.clone();
@@ -140,8 +140,8 @@ pub fn optimize_blocks(
 }
 
 // Elides `calls` in pure block p's version, then pins callees and replaces
-// operators; false if a check of an elided callee is left after the guard
-// prefix (it depends on what the version computes).
+// operators; false if a check of an elided callee can't be in the guard (it
+// depends on what the version computes).
 #[allow(clippy::too_many_arguments)]
 fn finish_block(
     cfg: &mut Cfg,
@@ -162,7 +162,7 @@ fn finish_block(
     }
     pin_calls(cfg, p, &obs.calls, is_null, pinned);
     use_aten(cfg, p, &obs.aten, &obs.calls, any);
-    !any || inline::tidy(cfg, p)
+    inline::tidy(cfg, p)
 }
 
 // A module's type has only dunder attributes, so any other name is read from
@@ -190,18 +190,33 @@ fn load_path(cfg: &Cfg, body: &HashSet<ValueId>, v: ValueId) -> Option<PinPath> 
 
 // Pins the callees of `calls` in pure block p's version (see the top of the
 // file), adding to its guard, and guards the params `is_null` says were
-// always NULL on being NULL. A callee loaded in the block is guarded on its
-// loads; one passed in as a param, on the param's identity.
+// always NULL on being NULL. A callee loaded in the block gets an Expect
+// on its load (which lift_guard makes a check of the guard); one passed in
+// as a param, a check of the param's identity.
 fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is_null: &dyn Fn(ValueId) -> bool, pinned: &mut Vec<ValueId>) {
     let body = cfg[p].versions[0].body.clone();
+    let handlers: HashMap<ValueId, Handler> = body.iter().enumerate().map(|(i, x)| (*x, cfg[p].versions[0].handler_at(i))).collect();
     let params = cfg[p].params.clone();
     let in_body: HashSet<ValueId> = body.iter().copied().collect();
-    let mut checks: Vec<Check> = params.iter().enumerate().filter(|(_, q)| is_null(**q)).map(|(i, _)| Check::Null(i as u32)).collect();
-    // Loads only the pinned callees read, made Null if nothing else reads them.
+    let mut checks: Vec<(Option<ValueId>, Check)> = params.iter().filter(|q| is_null(**q)).map(|q| (Some(*q), Check::Null)).collect();
+    // A LoadMethod (and its NULL) only a pinned callee reads, dropped if
+    // nothing else reads it.
     let mut chain = vec![];
-    // Pinned values for callees passed in, to put at the start of the body.
+    // Pinned values for the calls, to put at the start of the body.
     let mut prologue = vec![];
-    for &v in &body {
+    // The reads and checks of a loaded callee, after the instr they follow.
+    let mut after: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    // A loaded callee's check can go in the guard only if its loads come
+    // before anything that writes (see inline::tidy); a call pinned here
+    // doesn't write.
+    let mut first_write = body.len();
+    let mut pinned_here: HashSet<ValueId> = HashSet::new();
+    for (i, &v) in body.iter().enumerate() {
+        if let Some(&prev) = i.checked_sub(1).map(|j| &body[j]) {
+            if first_write == body.len() && !pinned_here.contains(&prev) && super::guard::writes(cfg, prev) {
+                first_write = i - 1;
+            }
+        }
         let Some(call) = calls.get(&v) else {
             continue;
         };
@@ -238,11 +253,16 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
         if path.is_none() && !matches!(form, Form::Param(_)) {
             continue;
         }
-        let name = match &path {
-            Some(path) => std::iter::once(path.global).chain(path.attrs.iter().copied()).map(|n| cfg.names[n as usize].as_str()).collect::<Vec<_>>().join("."),
-            None => call.name.clone(),
+        let checked_at = match form {
+            Form::Loaded => Some(a1),
+            Form::Method(m) => Some(cfg[m].args[0]),
+            Form::Param(_) => None,
         };
-        let pin = Pin { name, path };
+        if checked_at.is_some_and(|x| body.iter().position(|y| *y == x).is_none_or(|j| j >= first_write)) {
+            continue;
+        }
+        pinned_here.insert(v);
+        let pin = Pin { name: call.name.clone(), path };
         let k = match cfg.pins.iter().position(|q| *q == pin && q.path.is_some()) {
             Some(k) => k,
             None => {
@@ -251,39 +271,34 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
                 cfg.pins.len() - 1
             }
         } as u32;
-        let check = match form {
-            Form::Param(i) => Check::Is(i as u32, k),
-            _ => Check::Pinned(k),
-        };
-        if !checks.contains(&check) {
-            checks.push(check);
-        }
         cfg[v].args[0] = NULL;
+        let origin = cfg[v].origin;
+        let pv = cfg.add(Op::Pinned(k), vec![], origin);
+        prologue.push(pv);
+        cfg[v].args[1] = pv;
         match form {
-            Form::Param(_) => {
-                let pv = cfg.add(Op::Pinned(k), vec![], cfg[v].origin);
-                prologue.push(pv);
-                cfg[v].args[1] = pv;
-            }
-            Form::Loaded | Form::Method(_) => {
-                // The loads the callee was read through, from the callee down.
-                let mut x = match form {
-                    Form::Method(m) => {
-                        chain.push(a0);
-                        Some(m)
-                    }
-                    _ => cfg[a1].args.first().copied(),
-                };
-                while let Some(l) = x {
-                    chain.push(l);
-                    x = cfg[l].args.first().copied();
+            Form::Param(i) => {
+                let c = (Some(params[i]), Check::Is(k));
+                if !checks.contains(&c) {
+                    checks.push(c);
                 }
-                cfg[a1].op = Op::Pinned(k);
-                cfg[a1].args.clear();
+            }
+            Form::Loaded => {
+                let e = cfg.add(Op::expect(Check::Is(k)), vec![a1], origin);
+                after.entry(a1).or_default().push(e);
+            }
+            Form::Method(m) => {
+                // The attribute the LoadMethod found (a module's: no method).
+                let Op::LoadMethod(n) = cfg[m].op else { unreachable!("Form::Method") };
+                let module = cfg[m].args[0];
+                let attr = cfg.add(Op::LoadAttr(n), vec![module], origin);
+                let e = cfg.add(Op::expect(Check::Is(k)), vec![attr], origin);
+                after.entry(module).or_default().extend([attr, e]);
+                chain.extend([a0, a1, m]);
             }
         }
     }
-    if checks.is_empty() {
+    if checks.is_empty() && after.is_empty() && prologue.is_empty() {
         return;
     }
     // Drop the loads (and a LoadMethod's NULL) nothing reads any more, each
@@ -309,16 +324,20 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
             }
         }
     }
-    let ver = &mut cfg[p].versions[0];
-    // Unwind segments start at body indices.
-    let new_index = |i: usize| prologue.len() + body[..i].iter().filter(|v| !dead.contains(*v)).count();
-    for (k, seg) in ver.unwind.iter_mut().enumerate() {
-        // The first segment keeps covering the prologue.
-        seg.from = if k == 0 && seg.from == 0 { 0 } else { new_index(seg.from) };
+    let mut out = prologue;
+    let mut handler: HashMap<ValueId, Handler> = HashMap::new();
+    for x in body.iter().filter(|v| !dead.contains(*v)) {
+        out.push(*x);
+        for e in after.get(x).into_iter().flatten() {
+            handler.insert(*e, handlers[x].clone());
+            out.push(*e);
+        }
     }
-    ver.body = prologue.into_iter().chain(body.iter().copied().filter(|v| !dead.contains(v))).collect();
+    let first = body.first().map_or(Handler::Propagate, |x| handlers[x].clone());
+    let ver = &mut cfg[p].versions[0];
+    ver.body = out;
+    ver.set_unwind(|x| handlers.get(&x).or(handler.get(&x)).cloned().unwrap_or_else(|| first.clone()));
     ver.guard.checks.extend(checks);
-    // The loads could raise; a pinned callee can't.
     cfg.normalize_unwind(p);
 }
 
@@ -329,9 +348,9 @@ fn pin_calls(cfg: &mut Cfg, p: BlockId, calls: &HashMap<ValueId, PinnedCall>, is
 fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &HashMap<ValueId, PinnedCall>, elided: bool) {
     let params = cfg[p].params.clone();
     let body = cfg[p].versions[0].body.clone();
-    let mut checks: BTreeSet<Check> = BTreeSet::new();
-    // Values read in a version with elided calls (whose reads become its
-    // guard prefix, see inline::tidy), and the checks they need there.
+    let mut checks: BTreeSet<(Option<ValueId>, Check)> = BTreeSet::new();
+    // Values read in a version with elided calls (whose reads go in its
+    // guard, see cfg/guard.rs), and the checks they need there.
     let mut read_checks: BTreeSet<(ValueId, Check)> = BTreeSet::new();
     let is_read = |cfg: &Cfg, x: ValueId| elided && !matches!(cfg[x].op, Op::Param(_) | Op::Const(_) | Op::Pinned(_) | Op::Lit(_)) && inline::is_read(cfg, x);
     // Results of replaced ops: plain tensors whenever the guard holds.
@@ -343,10 +362,8 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
             let a = cfg[v].args.clone();
             let plain = |x: &ValueId| tensors.contains(x) || params.contains(x);
             if a.len() > 2 && a[0] == NULL && matches!(cfg[a[1]].op, Op::Pinned(_)) && a[2..].iter().all(plain) {
-                for x in &a[2..] {
-                    if let Some(i) = params.iter().position(|q| q == x) {
-                        checks.insert(Check::PlainTensor(i as u32));
-                    }
+                for x in a[2..].iter().filter(|x| params.contains(x)) {
+                    checks.insert((Some(*x), Check::PlainTensor));
                 }
                 falses.push(v);
             }
@@ -366,16 +383,16 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
         let ok = args.iter().zip(&kinds).all(|(x, kind)| match (params.iter().position(|q| q == x), kind) {
             (None, Some(kind)) if is_read(cfg, *x) && !tensors.contains(x) => {
                 need_read.push((*x, match kind {
-                    Arg::PlainTensor => Check::PlainTensor(0),
-                    Arg::Scalar(t) => Check::Exact(0, *t),
+                    Arg::PlainTensor => Check::PlainTensor,
+                    Arg::Scalar(t) => Check::Exact(*t),
                 }));
                 true
             }
-            (Some(i), Some(kind)) => {
-                need.push(match kind {
-                    Arg::PlainTensor => Check::PlainTensor(i as u32),
-                    Arg::Scalar(t) => Check::Exact(i as u32, *t),
-                });
+            (Some(_), Some(kind)) => {
+                need.push((Some(*x), match kind {
+                    Arg::PlainTensor => Check::PlainTensor,
+                    Arg::Scalar(t) => Check::Exact(*t),
+                }));
                 true
             }
             (Some(_), None) => false,
@@ -394,7 +411,7 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
         }
     }
     if !tensors.is_empty() || !falses.is_empty() {
-        checks.insert(Check::NoTorchFunctionMode);
+        checks.insert((None, Check::NoTorchFunctionMode));
         cfg[p].versions[0].guard.checks.extend(checks);
     }
     if !falses.is_empty() {
@@ -415,7 +432,7 @@ fn use_aten(cfg: &mut Cfg, p: BlockId, aten: &HashMap<ValueId, AtenOp>, calls: &
             out.push(v);
             for (_, c) in read_checks.iter().filter(|(x, _)| *x == v) {
                 let origin = cfg[v].origin;
-                out.push(cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![v], origin));
+                out.push(cfg.add(Op::expect(c.clone()), vec![v], origin));
             }
         }
         let ver = &mut cfg[p].versions[0];

@@ -143,22 +143,10 @@ pub enum Op {
     // The object Cfg::pins[i] resolved to when it was pinned (a version's
     // guard checks it still does).
     Pinned(u32),
-    // Checks that its arg is True (true) or False, and that it is (by
-    // identity) the object Cfg::pins[i]. Only in a version's guard prefix
-    // (see Version::prefix): checks of what the prefix read.
-    Expect(bool),
-    ExpectIs(u32),
-    // Checks that its arg's class runs Cfg::pins[pin] for Cfg::names[name]
-    // (looked up on the class, as for a special method like __call__).
-    ExpectTypeAttr { name: u32, pin: u32 },
-    // Checks that loading Cfg::names[name] from its arg falls back to its
-    // class's __getattr__, which is Cfg::pins[pin]: the class has the
-    // generic __getattribute__ and nothing by that name, and neither has the
-    // instance's __dict__.
-    ExpectGetattr { name: u32, pin: u32 },
-    // A guard check on its arg instead of a param (the check's param index
-    // is unused), on what the guard prefix read.
-    ExpectCheck(Box<Check>),
+    // A check of what elided or specialized code depends on, on its arg, as
+    // the optimizer copies the code in; lift_guard (cfg/guard.rs) moves each
+    // into the version's guard, so a version's body never has one.
+    Expect(Box<Check>),
     // Runs Cfg::trainings[i] on the block's params (its args), handing each
     // block output to its Project: the forward of a pure block, with its own
     // autograd node (see exec/autograd.rs).
@@ -167,6 +155,10 @@ pub enum Op {
 }
 
 impl Op {
+    pub fn expect(c: Check) -> Op {
+        Op::Expect(Box::new(c))
+    }
+
     pub fn can_raise(&self) -> bool {
         match self {
             Op::Null
@@ -207,10 +199,6 @@ impl Op {
             | Op::LoadFromDictOrDeref { .. }
             | Op::Aten { .. }
             | Op::Expect(_)
-            | Op::ExpectIs(_)
-            | Op::ExpectCheck(_)
-            | Op::ExpectTypeAttr { .. }
-            | Op::ExpectGetattr { .. }
             | Op::Autograd(_) => true,
             Op::Bytecode { opcode, .. } => opcodes::generic_can_raise(*opcode),
         }
@@ -229,10 +217,6 @@ impl Op {
             | Op::Resume
             | Op::EvalBreaker
             | Op::Expect(_)
-            | Op::ExpectIs(_)
-            | Op::ExpectCheck(_)
-            | Op::ExpectTypeAttr { .. }
-            | Op::ExpectGetattr { .. }
             | Op::Removed => false,
             Op::Bytecode { opcode, arg } => opcodes::signature(*opcode, *arg, false)
                 .is_some_and(|s| s.outputs.iter().any(|o| matches!(o, opcodes::Out::New))),
@@ -292,57 +276,49 @@ pub struct UnwindSegment {
     pub handler: Handler,
 }
 
-// Conditions checked before any of a version runs, on the block's params (by
-// position) or on global state.
+// Conditions a guard checks before any of a version runs, on a value (a
+// block param or read, see Guard) or, for the global ones, on nothing.
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug)]
 pub enum Check {
     // A tensor whose Python operators run as plain aten ops: exactly
     // torch.Tensor or nn.Parameter (no __torch_function__ of its own).
-    PlainTensor(u32),
+    PlainTensor,
     // Exactly this builtin type (not a subclass).
-    Exact(u32, Builtin),
-    // No __torch_function__ mode would intercept torch calls.
+    Exact(Builtin),
+    // A tensor that requires grad (true) or doesn't.
+    RequiresGrad(bool),
+    // A plain strided tensor with exactly this dtype, device, sizes and strides.
+    TensorMeta(Box<TensorSpec>),
+    // Exactly this scalar: same type, and the same value (floats bitwise).
+    Value(Lit),
+    // (By identity) the object Cfg::pins[i] was pinned to.
+    Is(u32),
+    // CPython's NULL (a LoadMethod's empty self slot).
+    Null,
+    // Exactly a tuple (true) or list of exactly these ints.
+    Ints(bool, Vec<i64>),
+    // Its class runs Cfg::pins[pin] for Cfg::names[name] (looked up on the
+    // class, as for a special method like __call__).
+    TypeAttr { name: u32, pin: u32 },
+    // Loading Cfg::names[name] from it falls back to its class's
+    // __getattr__, which is Cfg::pins[pin]: the class has the generic
+    // __getattribute__ and nothing by that name, and neither has the
+    // instance's __dict__.
+    Getattr { name: u32, pin: u32 },
+    // Global state: no __torch_function__ mode would intercept torch calls.
     NoTorchFunctionMode,
     // Grad mode is on (true) or off.
     GradEnabled(bool),
-    // A tensor param requires grad (true) or doesn't.
-    RequiresGrad(u32, bool),
-    // A plain strided tensor with exactly this dtype, device, sizes and strides.
-    TensorMeta(u32, Box<TensorSpec>),
-    // Exactly this scalar: same type, and the same value (floats bitwise).
-    Value(u32, Lit),
     // No forward-mode AD level is open.
     NoForwardAD,
     // No saved_tensors_hooks would pack tensors saved for backward.
     NoSavedTensorHooks,
-    // Cfg::pins[i]'s path still resolves to the object it was pinned to.
-    Pinned(u32),
-    // A param is (by identity) the object Cfg::pins[i] was pinned to.
-    Is(u32, u32),
-    // A param is CPython's NULL (a LoadMethod's empty self slot).
-    Null(u32),
-    // A param is exactly a tuple (true) or list of exactly these ints.
-    Ints(u32, bool, Vec<i64>),
 }
 
 impl Check {
-    // The param it checks, if any.
-    pub fn param(&self) -> Option<u32> {
-        match self {
-            Check::PlainTensor(p)
-            | Check::Exact(p, _)
-            | Check::RequiresGrad(p, _)
-            | Check::TensorMeta(p, _)
-            | Check::Value(p, _)
-            | Check::Is(p, _)
-            | Check::Null(p)
-            | Check::Ints(p, _, _) => Some(*p),
-            Check::NoTorchFunctionMode
-            | Check::GradEnabled(_)
-            | Check::NoForwardAD
-            | Check::NoSavedTensorHooks
-            | Check::Pinned(_) => None,
-        }
+    // Whether it checks global state rather than a value.
+    pub fn global(&self) -> bool {
+        matches!(self, Check::NoTorchFunctionMode | Check::GradEnabled(_) | Check::NoForwardAD | Check::NoSavedTensorHooks)
     }
 }
 
@@ -357,7 +333,8 @@ pub struct TensorSpec {
 }
 
 // An object an optimized version holds (see cfg/optimize.rs), named for
-// printing, and where it was read from if that can be checked again.
+// printing, and the global and module attributes it was read through, if
+// it was (pinned once per path; the guard reads them, see cfg/guard.rs).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pin {
     pub name: String,
@@ -425,8 +402,9 @@ pub enum Builtin {
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Guard {
-    // All must hold.
-    pub checks: Vec<Check>,
+    // All must hold, in order: each on its target (a param of the block or
+    // one of Block::reads), or on global state (None).
+    pub checks: Vec<(Option<ValueId>, Check)>,
 }
 
 // One way to run a block: when its guard holds, the body runs and produces the
@@ -438,12 +416,8 @@ pub struct Version {
     pub outputs: Vec<ValueId>,
     // Ordered by `from`.
     pub unwind: Vec<UnwindSegment>,
-    // The first `prefix` instrs of the body are part of the guard: reads
-    // (see inline::is_read) and the Expect ops checking what they read. A
-    // failed check, or a read raising, there is a miss (the origin runs, and
-    // nothing has to be undone). Nothing after them checks: a raise unwinds
-    // through the version's unwind segments.
-    pub prefix: usize,
+    // The Block::reads the body uses, read on entry before it runs.
+    pub inputs: Vec<ValueId>,
 }
 
 impl Version {
@@ -452,11 +426,10 @@ impl Version {
         self.unwind.iter().rev().find(|s| s.from <= i).map_or(Handler::Propagate, |s| s.handler.clone())
     }
 
-    // Sets the unwind segments from the handler of each instr past the
-    // prefix (raises in the prefix are misses).
+    // Sets the unwind segments from the handler of each instr.
     pub fn set_unwind(&mut self, handler: impl Fn(ValueId) -> Handler) {
         self.unwind.clear();
-        for (i, v) in self.body.iter().enumerate().skip(self.prefix) {
+        for (i, v) in self.body.iter().enumerate() {
             let h = handler(*v);
             if self.unwind.last().is_none_or(|s| s.handler != h) {
                 self.unwind.push(UnwindSegment { from: i, handler: h });
@@ -604,6 +577,13 @@ pub struct Block {
     // holds. Its ENTRY params correspond one-to-one to this block's params.
     pub origin: Option<Arc<Cfg>>,
     pub removed: bool,
+    // What the versions' guards check (Guard::checks) and their bodies take as
+    // inputs (Version::inputs): reads of the block's params, the namespaces
+    // and the frame's locals (see guard.rs), each once, in the order they
+    // first ran. On entry they run in order as far as a check needs them, so
+    // a read runs only after the checks that came before it; one that raises
+    // is a miss. Their args are params or earlier reads.
+    pub reads: Vec<ValueId>,
 }
 
 impl Block {
@@ -616,6 +596,7 @@ impl Block {
             handlers: vec![],
             origin: None,
             removed: false,
+            reads: vec![],
         }
     }
 
@@ -655,7 +636,7 @@ pub struct Cfg {
     pub names: Vec<String>,
     // What Op::Lit instrs hold.
     pub literals: Vec<Lit>,
-    // What Op::Pinned instrs hold and Check::Pinned checks.
+    // What Op::Pinned instrs hold, and Check::Is checks for.
     pub pins: Vec<Pin>,
     // Consts past the code's own (const_reprs): Op::Const(const_reprs.len()
     // + i) is the object Cfg::pins[const_pins[i]] (code inlined from another
@@ -988,10 +969,12 @@ impl<'a> Printer<'a> {
                 numbers.insert(*v, next);
                 next += 1;
             }
-            for v in cfg[b].versions.iter().flat_map(|ver| &ver.body) {
-                if cfg[*v].op.produces_value() {
-                    numbers.insert(*v, next);
-                    next += 1;
+            for ver in &cfg[b].versions {
+                for v in ver.inputs.iter().chain(&ver.body) {
+                    if cfg[*v].op.produces_value() && !numbers.contains_key(v) {
+                        numbers.insert(*v, next);
+                        next += 1;
+                    }
                 }
             }
         }
@@ -1131,11 +1114,7 @@ impl<'a> Printer<'a> {
             Op::Aten { name, kwnames } => format!("Aten {name} kw[{}]", kwnames.join(", ")),
             Op::Lit(i) => format!("Lit {}", self.cfg.literals.get(*i as usize).map_or("?".into(), |l| l.to_string())),
             Op::Pinned(i) => format!("Pinned {}", self.pin(*i)),
-            Op::Expect(b) => format!("Expect {}", if *b { "True" } else { "False" }),
-            Op::ExpectIs(i) => format!("ExpectIs {}", self.pin(*i)),
-            Op::ExpectCheck(c) => format!("ExpectCheck {}", self.check(&[], c)),
-            Op::ExpectTypeAttr { name, pin } => format!("ExpectTypeAttr {} {}", self.name(*name), self.pin(*pin)),
-            Op::ExpectGetattr { name, pin } => format!("ExpectGetattr {} {}", self.name(*name), self.pin(*pin)),
+            Op::Expect(c) => format!("Expect {}", self.check("_", c)),
             Op::Autograd(i) => format!("Autograd t{i}"),
             Op::Removed => "Removed".into(),
         }
@@ -1190,10 +1169,7 @@ impl<'a> Printer<'a> {
     }
 
     fn body(&self, out: &mut String, ver: &Version, indent: &str) {
-        for (i, v) in ver.body.iter().enumerate() {
-            if i == ver.prefix && i > 0 {
-                let _ = writeln!(out, "{indent}-- guard prefix ends --");
-            }
+        for v in &ver.body {
             let ins = &self.cfg[*v];
             let mut rhs = self.op(&ins.op);
             if !ins.args.is_empty() {
@@ -1220,45 +1196,102 @@ impl<'a> Printer<'a> {
         }
     }
 
-    // " [guard: ...]" for a non-empty guard.
-    fn guard(&self, blk: &Block, g: &Guard) -> String {
-        if g.checks.is_empty() {
-            return String::new();
-        }
-        let checks: Vec<String> = g.checks.iter().map(|c| self.check(&blk.params, c)).collect();
-        format!(" [guard: {}]", checks.join(", "))
-    }
-
-    // A check on `params` (by position; "_" past them: an ExpectCheck's arg).
-    fn check(&self, params: &[ValueId], c: &Check) -> String {
-        let param = |i: &u32| params.get(*i as usize).map_or("_".into(), |p| self.param_name(*p));
+    // Check `c` on what expression `e` holds ("" for a global check).
+    fn check(&self, e: &str, c: &Check) -> String {
         match c {
-            Check::PlainTensor(i) => format!("plain_tensor({})", param(i)),
-            Check::Exact(i, t) => format!("{}({})", format!("{t:?}").to_lowercase(), param(i)),
-            Check::NoTorchFunctionMode => "no_torch_function_mode".into(),
-            Check::GradEnabled(on) => if *on { "grad_enabled" } else { "grad_disabled" }.into(),
-            Check::RequiresGrad(i, on) => format!("{}({})", if *on { "requires_grad" } else { "no_requires_grad" }, param(i)),
-            Check::TensorMeta(i, t) => {
-                format!(
-                    "tensor({} {} {} {:?} stride {:?})",
-                    param(i),
-                    crate::bindings::ffi::dtype_name(t.dtype),
-                    crate::bindings::ffi::device_name(t.device_type, t.device_index),
-                    t.sizes,
-                    t.strides
-                )
-            }
-            Check::Value(i, l) => format!("value({} == {l})", param(i)),
-            Check::NoForwardAD => "no_forward_ad".into(),
-            Check::NoSavedTensorHooks => "no_saved_tensor_hooks".into(),
-            Check::Pinned(i) => format!("pinned({})", self.pin(*i)),
-            Check::Is(p, i) => format!("is({}, {})", param(p), self.pin(*i)),
-            Check::Null(p) => format!("null({})", param(p)),
-            Check::Ints(p, tuple, ns) => {
+            Check::PlainTensor => format!("{e} is a plain tensor"),
+            Check::Exact(t) => format!("type({e}) is {}", format!("{t:?}").to_lowercase()),
+            Check::RequiresGrad(on) => format!("{}{e}.requires_grad", if *on { "" } else { "not " }),
+            Check::TensorMeta(t) => format!(
+                "{e} is tensor({} {} {:?} stride {:?})",
+                crate::bindings::ffi::dtype_name(t.dtype),
+                crate::bindings::ffi::device_name(t.device_type, t.device_index),
+                t.sizes,
+                t.strides
+            ),
+            Check::Value(Lit::Bool(true)) => e.to_string(),
+            Check::Value(Lit::Bool(false)) => format!("not {e}"),
+            Check::Value(Lit::None) => format!("{e} is None"),
+            Check::Value(l) => format!("{e} == {l}"),
+            Check::Is(k) => format!("{e} is {}", self.pin(*k)),
+            Check::Null => format!("{e} is NULL"),
+            Check::Ints(tuple, ns) => {
                 let ns: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
                 let (l, r) = if *tuple { ("(", if ns.len() == 1 { ",)" } else { ")" }) } else { ("[", "]") };
-                format!("value({} == {l}{}{r})", param(p), ns.join(", "))
+                format!("{e} == {l}{}{r}", ns.join(", "))
             }
+            Check::TypeAttr { name, pin } => format!("type({e}).{} is {}", self.name(*name), self.pin(*pin)),
+            Check::Getattr { name, pin } => format!("{e}.{} falls back to {}", self.name(*name), self.pin(*pin)),
+            Check::NoTorchFunctionMode => "no torch function mode".into(),
+            Check::GradEnabled(on) => if *on { "grad enabled" } else { "grad disabled" }.into(),
+            Check::NoForwardAD => "no forward AD".into(),
+            Check::NoSavedTensorHooks => "no saved tensor hooks".into(),
+        }
+    }
+
+    // The guard's checks, then what the body takes as inputs, each with
+    // what it reads written out as an expression; a read more than one of
+    // those use (but a leaf: a global, local or constant) is named once.
+    fn guard(&self, out: &mut String, blk: &Block, ver: &Version, indent: &str) {
+        let mut uses: HashMap<ValueId, usize> = HashMap::new();
+        let targets = ver.guard.checks.iter().filter_map(|(x, _)| x.as_ref());
+        for x in blk.reads.iter().flat_map(|r| &self.cfg[*r].args).chain(targets).chain(&ver.inputs) {
+            *uses.entry(*x).or_default() += 1;
+        }
+        let leaf = |v: &ValueId| self.cfg[*v].args.iter().all(|a| a.is_reserved());
+        let mut names: HashMap<ValueId, usize> = HashMap::new();
+        for r in blk.reads.iter().filter(|r| uses.get(r).copied().unwrap_or(0) > 1 && !leaf(r)) {
+            let e = self.expr(blk, *r, &names);
+            let _ = writeln!(out, "{indent}${} = {e}", names.len());
+            names.insert(*r, names.len());
+        }
+        for (x, c) in &ver.guard.checks {
+            let e = x.map_or(String::new(), |x| self.expr(blk, x, &names));
+            let _ = writeln!(out, "{indent}guard {}", self.check(&e, c));
+        }
+        for v in &ver.inputs {
+            let _ = writeln!(out, "{indent}{} = input {}", self.val(*v), self.expr(blk, *v, &names));
+        }
+    }
+
+    // What block param or read `v` holds, as an expression, with the reads
+    // in `names` by name.
+    fn expr(&self, blk: &Block, v: ValueId, names: &HashMap<ValueId, usize>) -> String {
+        if let Some(n) = names.get(&v) {
+            return format!("${n}");
+        }
+        if blk.params.contains(&v) {
+            return self.param_name(v);
+        }
+        if !blk.reads.contains(&v) {
+            return self.val(v);
+        }
+        let ins = &self.cfg[v];
+        let a = |k: usize| self.expr(blk, ins.args[k], names);
+        let tail = |s: String| s.split_once(' ').map_or(s.clone(), |(_, t)| t.to_string());
+        match &ins.op {
+            Op::LoadGlobal(n) | Op::LoadGlobalIn { name: n, .. } => self.name(*n).into(),
+            Op::LoadLocal { slot } => self.slot(*slot).into(),
+            Op::LoadAttr(n) => format!("{}.{}", a(0), self.name(*n)),
+            Op::Project(k) => match &self.cfg[ins.args[0]].op {
+                Op::LoadMethod(n) => format!("{}.{}[{k}]", self.expr(blk, self.cfg[ins.args[0]].args[0], names), self.name(*n)),
+                _ => self.val(v),
+            },
+            Op::Bytecode { opcode: opcodes::BINARY_SUBSCR, .. } => format!("{}[{}]", a(0), a(1)),
+            Op::Bytecode { opcode: opcodes::CONTAINS_OP, arg } => format!("{} {} {}", a(0), if *arg == 1 { "not in" } else { "in" }, a(1)),
+            Op::Bytecode { opcode: opcodes::IS_OP, arg } => format!("{} {} {}", a(0), if *arg == 1 { "is not" } else { "is" }, a(1)),
+            Op::Bytecode { opcode: opcodes::BUILD_MAP, .. } => "{}".into(),
+            Op::Compare(k) => format!("{} {} {}", a(0), COMPARE_OPS.get(*k as usize).copied().unwrap_or("?"), a(1)),
+            // A compare, `in`, `is` or IsNone is a bool already.
+            Op::ToBool => match &self.cfg[ins.args[0]].op {
+                Op::Compare(_) | Op::IsNone | Op::Bytecode { opcode: opcodes::CONTAINS_OP | opcodes::IS_OP, .. } if blk.reads.contains(&ins.args[0]) => a(0),
+                _ => format!("bool({})", a(0)),
+            },
+            Op::IsNone => format!("{} is None", a(0)),
+            Op::Call { .. } => format!("{}()", a(1)),
+            Op::Const(_) | Op::Pinned(_) | Op::Lit(_) => tail(self.op(&ins.op)),
+            Op::BuildTuple(_) => format!("({})", (0..ins.args.len()).map(a).collect::<Vec<_>>().join(", ")),
+            _ => self.val(v),
         }
     }
 
@@ -1295,7 +1328,7 @@ impl<'a> Printer<'a> {
             match blk.versions.as_slice() {
                 // A single unguarded version prints inline, with its outputs
                 // shown as the values they are.
-                [ver] if ver.guard.checks.is_empty() && ver.prefix == 0 => {
+                [ver] if ver.guard == Guard::default() && ver.inputs.is_empty() => {
                     self.body(out, ver, &inner);
                     let vals = |o: OutIdx| self.val(ver.outputs[o as usize]);
                     let _ = writeln!(out, "{inner}{}", self.term(blk, &vals));
@@ -1304,7 +1337,8 @@ impl<'a> Printer<'a> {
                 }
                 versions => {
                     for ver in versions {
-                        let _ = writeln!(out, "{inner}version{}:", self.guard(blk, &ver.guard));
+                        let _ = writeln!(out, "{inner}version:");
+                        self.guard(out, blk, ver, &deeper);
                         self.body(out, ver, &deeper);
                         let _ = writeln!(out, "{deeper}outputs [{}]", self.vals(&ver.outputs));
                         self.unwind(out, blk, ver, &deeper);

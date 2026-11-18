@@ -4,7 +4,7 @@
 // The callee's locals and cells become SSA values, its globals are read from
 // its own namespace, and each branch condition becomes an Expect, as does the
 // callee's identity. Those checks have to end up in the version's guard
-// prefix (see tidy), so a failing one runs the block's origin, which makes
+// (see guard.rs), so a failing one runs the block's origin, which makes
 // the real call; an elision whose checks depend on what the version computes
 // is refused. A raise in the elided code unwinds from the version as the
 // call would have, without the callee's frame in the traceback.
@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::ir::{BlockId, Cfg, Exit, Handler, NULL, Op, OutIdx, Terminator, ValueId, ENTRY};
+use super::ir::{BlockId, Cfg, Check, Exit, Handler, Lit, NULL, Op, OutIdx, Terminator, ValueId, ENTRY};
 use super::opcodes;
 use super::optimize::Observed;
 
@@ -143,8 +143,8 @@ pub fn elide(cfg: &mut Cfg, p: BlockId, v: ValueId, inl: &Inlinee, obs: &mut Obs
 
 // Tidies block p's version after elisions (and the pinning and aten
 // replacement that follow them): drops values nothing uses that can't
-// raise, and hoists the reads into its guard prefix. False if a check is
-// left after the prefix.
+// raise, and lifts the reads and checks into its guard. False if a check
+// stays in the body.
 pub fn tidy(cfg: &mut Cfg, p: BlockId) -> bool {
     // Known bools: ToBool of one is itself, and an Expect of it holds (or
     // the version can't run: left for the origin).
@@ -160,7 +160,7 @@ pub fn tidy(cfg: &mut Cfg, p: BlockId) -> bool {
         cfg[v].args = a.clone();
         match &cfg[v].op {
             Op::Lit(k) => {
-                if let super::ir::Lit::Bool(b) = cfg.literals[*k as usize] {
+                if let Lit::Bool(b) = cfg.literals[*k as usize] {
                     known.insert(v, b);
                 }
             }
@@ -168,7 +168,7 @@ pub fn tidy(cfg: &mut Cfg, p: BlockId) -> bool {
                 subst.insert(v, a[0]);
                 continue;
             }
-            Op::Expect(want) if known.get(&a[0]) == Some(want) => continue,
+            Op::Expect(c) if matches!(**c, Check::Value(Lit::Bool(want)) if known.get(&a[0]) == Some(&want)) => continue,
             _ => {}
         }
         kept.push(v);
@@ -216,21 +216,22 @@ pub fn tidy(cfg: &mut Cfg, p: BlockId) -> bool {
         body.retain(|v| !dead.contains(v));
     }
     cfg[p].versions[0].body = body;
-    hoist_reads(cfg, p, |_, _| false);
-    cfg[p].versions[0].set_unwind(|x| handlers[&x].clone());
-    let ok = checks_in_prefix(cfg, p);
-    cfg.normalize_unwind(p);
-    ok
+    // A read after something that writes Python state stays where it is.
+    let mut wrote = false;
+    super::guard::lift_guard(
+        cfg,
+        p,
+        |cfg, x| {
+            let stale = wrote;
+            wrote |= super::guard::writes(cfg, x);
+            stale
+        },
+        |x| handlers[&x].clone(),
+    )
 }
 
 pub fn is_check(op: &Op) -> bool {
-    matches!(op, Op::Expect(_) | Op::ExpectIs(_) | Op::ExpectCheck(_) | Op::ExpectTypeAttr { .. } | Op::ExpectGetattr { .. })
-}
-
-// Whether every check of block p's version is in its guard prefix.
-pub fn checks_in_prefix(cfg: &Cfg, p: BlockId) -> bool {
-    let ver = &cfg[p].versions[0];
-    !ver.body[ver.prefix..].iter().any(|x| is_check(&cfg[*x].op))
+    matches!(op, Op::Expect(_))
 }
 
 // Copies inl's path into `out`; returns the value it returns. `call`: the
@@ -271,22 +272,22 @@ fn splice(
             };
             match callable {
                 Callable::Function => {
-                    add(cfg, out, Op::ExpectIs(inl.function), vec![target]);
+                    add(cfg, out, Op::expect(Check::Is(inl.function)), vec![target]);
                 }
                 Callable::BoundMethod => {
                     let f = add(cfg, out, Op::LoadAttr(func_name), vec![target]);
-                    add(cfg, out, Op::ExpectIs(inl.function), vec![f]);
+                    add(cfg, out, Op::expect(Check::Is(inl.function)), vec![f]);
                     args.push(add(cfg, out, Op::LoadAttr(self_name), vec![target]));
                 }
                 Callable::Instance => {
-                    add(cfg, out, Op::ExpectTypeAttr { name: call_name, pin: inl.function }, vec![target]);
+                    add(cfg, out, Op::expect(Check::TypeAttr { name: call_name, pin: inl.function }), vec![target]);
                     args.push(target);
                 }
             }
             args.extend(rest);
         }
         Site::Getattr { name, str } => {
-            add(cfg, out, Op::ExpectGetattr { name: *name, pin: inl.function }, vec![call[0]]);
+            add(cfg, out, Op::expect(Check::Getattr { name: *name, pin: inl.function }), vec![call[0]]);
             args.push(call[0]);
             args.push(add(cfg, out, Op::Pinned(*str), vec![]));
         }
@@ -294,7 +295,7 @@ fn splice(
     if let Some((tuple, name)) = inl.defaults {
         let f = add(cfg, out, Op::Pinned(inl.function), vec![]);
         let d = add(cfg, out, Op::LoadAttr(name), vec![f]);
-        add(cfg, out, Op::ExpectIs(tuple), vec![d]);
+        add(cfg, out, Op::expect(Check::Is(tuple)), vec![d]);
     }
     let mut slots: HashMap<u32, ValueId> = HashMap::new();
     for (i, b) in inl.bind.iter().enumerate() {
@@ -330,8 +331,12 @@ fn splice(
         })
     };
     let konst = |cfg: &mut Cfg, k: u32| -> u32 {
-        cfg.const_pins.push(inl.consts[k as usize]);
-        (cfg.const_reprs.len() + cfg.const_pins.len() - 1) as u32
+        let pin = inl.consts[k as usize];
+        let i = cfg.const_pins.iter().position(|p| *p == pin).unwrap_or_else(|| {
+            cfg.const_pins.push(pin);
+            cfg.const_pins.len() - 1
+        });
+        (cfg.const_reprs.len() + i) as u32
     };
     let mut vals: HashMap<ValueId, ValueId> = HashMap::new();
     let mut b = ENTRY;
@@ -435,7 +440,7 @@ fn splice(
             Terminator::Branch { cond, then, else_ } => {
                 let dir = inl.dirs[&b];
                 let c = output(&vals, *cond)?;
-                add(cfg, out, Op::Expect(dir), vec![c]);
+                add(cfg, out, Op::expect(Check::Value(Lit::Bool(dir))), vec![c]);
                 if dir { then } else { else_ }
             }
             _ => return None,
@@ -451,34 +456,9 @@ fn splice(
     }
 }
 
-// Moves the reads and checks of block p's version that don't depend on what
-// it computes (or on what `stale` says was written before them) ahead of
-// everything else, in order, and makes them its guard prefix, as Dynamo
-// checks its guards before running its graph: a check that fails then
-// misses before anything else ran. Reads move ahead of compute that can't
-// change what they read (aten ops, and calls the version may hold: pinned or
-// in-graph ones).
-pub fn hoist_reads(cfg: &mut Cfg, p: BlockId, mut stale: impl FnMut(&Cfg, ValueId) -> bool) {
-    let body = cfg[p].versions[0].body.clone();
-    let mut computed: HashSet<ValueId> = HashSet::new();
-    let (mut reads, mut rest) = (vec![], vec![]);
-    for x in body {
-        if !stale(cfg, x) && is_read(cfg, x) && !cfg[x].args.iter().any(|a| computed.contains(a)) {
-            reads.push(x);
-        } else {
-            computed.insert(x);
-            rest.push(x);
-        }
-    }
-    let ver = &mut cfg[p].versions[0];
-    ver.prefix = reads.len();
-    reads.extend(rest);
-    ver.body = reads;
-}
-
 // Ops that only read (or check) what they're given, the namespaces they name
-// and the frame's locals: what a guard prefix may hold. That includes a call of a pinned
-// callee with no args (a predicate like torch._C._is_tracing()).
+// and the frame's locals: what a guard may read (see guard.rs). That
+// includes a call of a pinned callee with no args (a predicate like torch._C._is_tracing()).
 pub fn is_read(cfg: &Cfg, v: ValueId) -> bool {
     let ins = &cfg[v];
     if let Op::Call { .. } = ins.op {
@@ -497,10 +477,6 @@ pub fn is_read(cfg: &Cfg, v: ValueId) -> bool {
             | Op::Const(_)
             | Op::Lit(_)
             | Op::Expect(_)
-            | Op::ExpectIs(_)
-            | Op::ExpectCheck(_)
-            | Op::ExpectTypeAttr { .. }
-            | Op::ExpectGetattr { .. }
             | Op::IsNone
             | Op::ToBool
             | Op::Compare(_)

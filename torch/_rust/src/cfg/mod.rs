@@ -7,6 +7,7 @@
 
 pub mod blocks;
 pub mod bytecode;
+pub mod guard;
 pub mod inline;
 pub mod interp;
 pub mod ir;

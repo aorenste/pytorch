@@ -19,8 +19,6 @@ use super::{Compiled, Prepared};
 enum Exc {
     Error,
     Reraise,
-    // An Expect failed (no exception is set): only in a guard prefix.
-    Abort,
 }
 
 type R = Result<(), Exc>;
@@ -203,7 +201,7 @@ impl Code {
                 .collect();
             let dropped: std::collections::HashSet<&ValueId> = lv.entry_kill.iter().chain(&kills).collect();
             let mut exit_kill: Vec<ValueId> =
-                blk.params.iter().chain(&ver.body).filter(|v| holds(v) && !dropped.contains(v)).copied().collect();
+                blk.params.iter().chain(&ver.inputs).chain(&ver.body).filter(|v| holds(v) && !dropped.contains(v)).copied().collect();
             exit_kill.sort();
             let exits: Vec<&Exit> = match &blk.term {
                 Terminator::Jump(e) => vec![e],
@@ -236,20 +234,21 @@ impl Code {
     }
 }
 
+// Whether `guard` pins `x` down (it's NULL, or a pinned object), so it can
+// be passed through as it is.
+fn pins_down(guard: &Guard, x: ValueId) -> bool {
+    guard.checks.iter().any(|(t, c)| *t == Some(x) && matches!(c, Check::Null | Check::Is(_)))
+}
+
 // How run_blocks continues after a step.
 enum Next {
     Step,
     // A raise went to this handler (entered).
     Block(BlockId),
     Done(Outcome),
-    // The guard prefix missed (the version's values released, no exception
-    // set): run the block's origin.
-    Miss,
 }
 
 pub const FLAG_RAISE: u8 = 1;
-// In a version's guard prefix (see Version::prefix).
-pub const FLAG_PREFIX: u8 = 1 << 6;
 // Its own id holds a value (not a multi-output instr's), observed when it's
 // defined.
 pub const FLAG_VALUE: u8 = 2;
@@ -466,7 +465,7 @@ impl Act<'_> {
     // Drops what is left of a version's values when control leaves the block.
     unsafe fn clear(&mut self, b: BlockId, ver: usize) {
         let blk = &self.cfg[b];
-        for v in blk.params.iter().chain(&blk.versions[ver].body) {
+        for v in blk.params.iter().chain(&blk.versions[ver].inputs).chain(&blk.versions[ver].body) {
             self.set(*v, std::ptr::null_mut());
         }
     }
@@ -513,35 +512,91 @@ impl Act<'_> {
         }
     }
 
-    // The version of `b` to run: the first whose guard holds. None: run its
-    // origin.
+    // The version of `b` to run: the first whose guard holds, with its
+    // inputs read. None: run its origin.
     unsafe fn select(&mut self, b: BlockId) -> Option<usize> {
-        let vers = &self.cfg[b].versions;
-        let ver = if vers.len() == 1 && vers[0].guard.checks.is_empty() {
+        let blk = &self.cfg[b];
+        let vers = &blk.versions;
+        let ver = if vers.len() == 1 && vers[0].guard.checks.is_empty() && vers[0].inputs.is_empty() {
             0
         } else {
-            vers.iter().position(|v| v.guard.checks.iter().all(|c| self.check(b, c)))?
+            let mut done = 0;
+            let mut chosen = None;
+            for vi in 0..vers.len() {
+                match self.guard_holds(b, vi, &mut done) {
+                    Some(true) => {
+                        chosen = Some(vi);
+                        break;
+                    }
+                    Some(false) => {}
+                    None => break,
+                }
+            }
+            self.drop_reads(b, done, chosen);
+            chosen?
         };
-        // A version with a guard prefix may run its origin on all the
-        // params, so it keeps them (see run_blocks).
-        if vers[ver].prefix == 0 {
-            self.drop_all(&self.p.live.versions[b.idx()][ver].entry_kill);
-        }
+        self.drop_all(&self.p.live.versions[b.idx()][ver].entry_kill);
         Some(ver)
     }
 
-    unsafe fn check(&self, b: BlockId, c: &Check) -> bool {
-        self.check_on(c, |i| self.val(self.cfg[b].params[i as usize]))
+    // Whether version vi's guard holds, running b's reads (from `*done`) as
+    // far as its checks need, and then as far as its inputs need. None: a
+    // read raised (cleared).
+    unsafe fn guard_holds(&mut self, b: BlockId, vi: usize, done: &mut usize) -> Option<bool> {
+        let cfg = self.cfg;
+        let ver = &cfg[b].versions[vi];
+        for (x, c) in &ver.guard.checks {
+            if let Some(x) = x {
+                let k = self.p.read_pos[x.idx()];
+                if k != u32::MAX && !self.read_upto(b, done, k as usize) {
+                    return None;
+                }
+            }
+            if !self.check(c, x.map_or(std::ptr::null_mut(), |x| self.val(x))) {
+                return Some(false);
+            }
+        }
+        match ver.inputs.iter().map(|x| self.p.read_pos[x.idx()]).max() {
+            Some(k) if !self.read_upto(b, done, k as usize) => None,
+            _ => Some(true),
+        }
     }
 
-    // `c` with `param(i)` as its params' values.
-    unsafe fn check_on(&self, c: &Check, param: impl Fn(u32) -> *mut PyObject) -> bool {
-        let param = |i: &u32| param(*i);
+    // Runs b's reads from `*done` through the one at `upto`. False if one
+    // raised (cleared: a miss).
+    unsafe fn read_upto(&mut self, b: BlockId, done: &mut usize, upto: usize) -> bool {
+        let cfg = self.cfg;
+        while *done <= upto {
+            let v = cfg[b].reads[*done];
+            *done += 1;
+            if self.exec(v, &cfg[v]).is_err() {
+                ffi::PyErr_Clear();
+                return false;
+            }
+        }
+        true
+    }
+
+    // Drops what b's first `done` reads left, but version `keep`'s inputs.
+    unsafe fn drop_reads(&mut self, b: BlockId, done: usize, keep: Option<usize>) {
+        let blk = &self.cfg[b];
+        for r in &blk.reads[..done] {
+            if keep.is_none_or(|vi| !blk.versions[vi].inputs.contains(r)) {
+                self.set(*r, std::ptr::null_mut());
+            }
+        }
+    }
+
+    // Whether `c` holds of `o` (NULL for a global check, or a NULL value).
+    unsafe fn check(&self, c: &Check, o: *mut PyObject) -> bool {
+        if o.is_null() && !c.global() {
+            return *c == Check::Null;
+        }
         let tensor = |o: *mut PyObject| tffi::tensor_by_type(o as usize).as_ref();
         match c {
-            Check::PlainTensor(i) => super::is_plain_tensor(param(i)),
-            Check::Exact(i, t) => {
-                let tp = ffi::Py_TYPE(param(i));
+            Check::PlainTensor => super::is_plain_tensor(o),
+            Check::Exact(t) => {
+                let tp = ffi::Py_TYPE(o);
                 tp == match t {
                     Builtin::Int => &raw mut ffi::PyLong_Type,
                     Builtin::Float => &raw mut ffi::PyFloat_Type,
@@ -551,11 +606,10 @@ impl Act<'_> {
             }
             Check::NoTorchFunctionMode => !tffi::torch_function_mode_active(),
             Check::GradEnabled(on) => tffi::grad_mode_enabled() == *on,
-            Check::RequiresGrad(i, on) => tensor(param(i)).is_some_and(|t| t.requires_grad() == *on),
-            Check::TensorMeta(i, m) => tensor(param(i))
+            Check::RequiresGrad(on) => tensor(o).is_some_and(|t| t.requires_grad() == *on),
+            Check::TensorMeta(m) => tensor(o)
                 .is_some_and(|t| tffi::tensor_matches(t, m.dtype, m.device_type, m.device_index, &m.sizes, &m.strides)),
-            Check::Value(i, l) => {
-                let o = param(i);
+            Check::Value(l) => {
                 let tp = ffi::Py_TYPE(o);
                 match l {
                     Lit::None => o == ffi::Py_None(),
@@ -572,22 +626,9 @@ impl Act<'_> {
             }
             Check::NoForwardAD => !tffi::forward_ad_active(),
             Check::NoSavedTensorHooks => !tffi::saved_tensor_hooks_active(),
-            Check::Pinned(k) => match &self.cfg.pins[*k as usize].path {
-                Some(path) => {
-                    let (globals, builtins) = match path.ns {
-                        Some((g, b)) => (self.p.pins[g as usize].as_ptr(), self.p.pins[b as usize].as_ptr()),
-                        None => (std::ptr::null_mut(), std::ptr::null_mut()),
-                    };
-                    let names: Vec<*mut PyObject> = std::iter::once(path.global).chain(path.attrs.iter().copied()).map(|n| self.name(n)).collect();
-                    (!self.f.is_null() || !globals.is_null())
-                        && tr_resolve_pin(self.f, globals, builtins, names.as_ptr(), names.len() as isize) == self.p.pins[*k as usize].as_ptr()
-                }
-                None => false,
-            },
-            Check::Is(i, k) => param(i) == self.p.pins[*k as usize].as_ptr(),
-            Check::Null(i) => param(i).is_null(),
-            Check::Ints(i, tuple, ns) => {
-                let o = param(i);
+            Check::Is(k) => o == self.p.pins[*k as usize].as_ptr(),
+            Check::Null => false,
+            Check::Ints(tuple, ns) => {
                 let exact = if *tuple { ffi::PyTuple_CheckExact(o) } else { ffi::PyList_CheckExact(o) } != 0;
                 exact
                     && ffi::Py_SIZE(o) as usize == ns.len()
@@ -597,6 +638,8 @@ impl Act<'_> {
                         ffi::Py_TYPE(x) == &raw mut ffi::PyLong_Type && ffi::PyLong_AsLongLongAndOverflow(x, &mut overflow) == *n && overflow == 0
                     })
             }
+            Check::TypeAttr { name, pin } => tr_type_attr_is(o, self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0,
+            Check::Getattr { name, pin } => tr_getattr_falls_back(o, self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0,
         }
     }
 
@@ -611,9 +654,8 @@ impl Act<'_> {
 
     // Runs b's origin with its own autograd node (see autograd.rs).
     unsafe fn bootstrap(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
-        let k = self.cfg[b].versions[0].prefix;
-        if k > 0 {
-            return self.bootstrap_prefix(b, k);
+        if !self.cfg[b].reads.is_empty() {
+            return self.bootstrap_inputs(b);
         }
         let params = self.take_params(b);
         let at = super::autograd::Where { compiled: super::shared(self.c.expect("a frame's Act")), prep: self.p as *const Prepared as usize, block: b };
@@ -622,7 +664,7 @@ impl Act<'_> {
         let blk = &self.cfg[b];
         let read = |q: ValueId| blk.versions[0].body.iter().any(|v| self.cfg[*v].args.contains(&q));
         let pinned: Vec<bool> = (0..params.len() as u32)
-            .map(|i| blk.versions[0].guard.checks.iter().any(|c| matches!(c, Check::Null(j) | Check::Is(j, _) if *j == i)) || !read(blk.params[i as usize]))
+            .map(|i| pins_down(&blk.versions[0].guard, blk.params[i as usize]) || !read(blk.params[i as usize]))
             .collect();
         let started = super::outside_executor(|| super::autograd::Bootstrap::start(&params, &pinned, at));
         let result = match started {
@@ -677,16 +719,22 @@ impl Act<'_> {
         *self.p.autograd_why[b.idx()].get() = Some(format!("the traced run raised {}", why.as_deref().unwrap_or("?")));
     }
 
-    // Bootstraps block b, whose version has a guard prefix of k instrs: runs
-    // the prefix, then (outside the executor, under the tracer) the rest of
-    // the version on the params and the prefix's values, which the node's
+    // Bootstraps block b, whose version has reads in its guard: checks them
+    // and reads its inputs, then runs (outside the executor, under the
+    // tracer) the version's body on the params and inputs, which the node's
     // edges then go to, instead of the origin (which would read them again).
-    // A miss in the prefix runs the origin, as the version would; a raise in
-    // the rest unwinds from the version.
-    unsafe fn bootstrap_prefix(&mut self, b: BlockId, k: usize) -> Result<BlockId, Outcome> {
+    // A miss runs the origin, as it would without autograd; a raise in the
+    // body unwinds from the version.
+    unsafe fn bootstrap_inputs(&mut self, b: BlockId) -> Result<BlockId, Outcome> {
         let cfg = self.cfg;
         let blk = &cfg[b];
         let ver = &blk.versions[0];
+        let mut done = 0;
+        let held = self.guard_holds(b, 0, &mut done) == Some(true);
+        self.drop_reads(b, done, held.then_some(0));
+        if !held {
+            return self.miss(b);
+        }
         let saved: Vec<*mut PyObject> = blk.params.iter().map(|p| xincref(self.val(*p))).collect();
         let rerun = |this: &mut Self, saved: Vec<*mut PyObject>| {
             if !ffi::PyErr_Occurred().is_null() {
@@ -696,20 +744,14 @@ impl Act<'_> {
             let result = this.run_origin(b, saved);
             this.after_origin(b, result)
         };
-        for v in &ver.body[..k] {
-            if self.exec(*v, &cfg[*v]).is_err() {
-                return rerun(self, saved);
-            }
-        }
-        let carried = crate::cfg::partition::carried(cfg, ver, k);
-        let ids: Vec<ValueId> = blk.params.iter().chain(&carried).copied().collect();
+        let ids: Vec<ValueId> = blk.params.iter().chain(&ver.inputs).copied().collect();
         let args: Vec<*mut PyObject> = ids.iter().map(|x| self.val(*x)).collect();
         let needs = args.iter().any(|o| !o.is_null() && tffi::tensor_by_type(*o as usize).as_ref().is_some_and(|t| t.requires_grad()));
         // Run the rest; Leave with the outputs, or Error (where it raised,
         // and how, in `failed`).
         let mut failed: Option<(usize, Exc)> = None;
         let mut run_rest = |this: &mut Self| {
-            for (i, v) in ver.body.iter().enumerate().skip(k) {
+            for (i, v) in ver.body.iter().enumerate() {
                 this.set_instr(cfg[*v].origin as c_int);
                 if let Err(how) = this.exec(*v, &cfg[*v]) {
                     failed = Some((i, how));
@@ -720,25 +762,16 @@ impl Act<'_> {
         };
         let result = if needs {
             // Passed through as they are: what the guard pins down, what
-            // only the prefix reads (or only becomes an output), and pinned
+            // the body doesn't read (only passes on as an output), and pinned
             // objects and constants.
-            let compute_reads = |q: ValueId| ver.body[k..].iter().any(|v| cfg[*v].args.contains(&q));
+            let compute_reads = |q: ValueId| ver.body.iter().any(|v| cfg[*v].args.contains(&q));
             let pinned: Vec<bool> = ids
                 .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let i = i as u32;
-                    ver.guard.checks.iter().any(|c| matches!(c, Check::Null(j) | Check::Is(j, _) if *j == i))
-                        || !compute_reads(*x)
-                        || matches!(cfg[*x].op, Op::Pinned(_) | Op::Const(_) | Op::Lit(_))
-                })
+                .map(|x| pins_down(&ver.guard, *x) || !compute_reads(*x) || matches!(cfg[*x].op, Op::Pinned(_) | Op::Const(_) | Op::Lit(_)))
                 .collect();
             let at = super::autograd::Where { compiled: super::shared(self.c.expect("a frame's Act")), prep: self.p as *const Prepared as usize, block: b };
             match super::outside_executor(|| super::autograd::Bootstrap::start(&args, &pinned, at)) {
-                Ok(None) => match run_rest(self) {
-                    Outcome::Error => return rerun(self, saved),
-                    r => r,
-                },
+                Ok(None) => run_rest(self),
                 Ok(Some((boot, call))) => {
                     for (x, obj) in ids.iter().zip(call) {
                         let old = std::mem::replace(&mut self.vals[x.idx()], obj);
@@ -785,15 +818,20 @@ impl Act<'_> {
         self.after_origin(b, result)
     }
 
-    // Whether b's block may bootstrap now: its version's guard holds, grad
-    // mode is on and a tensor param requires grad (or, with a guard prefix,
-    // grad mode is on: what the prefix reads is only known after it runs).
+    // Whether b's block may bootstrap now: its version's guard holds (but its
+    // checks on reads, see bootstrap_inputs), grad mode is on and a tensor
+    // param requires grad (or, with inputs, grad mode is on: they're only
+    // known once read).
     unsafe fn wants_autograd(&self, b: BlockId) -> bool {
         let blk = &self.cfg[b];
         super::autograd::enabled()
             && tffi::grad_mode_enabled()
-            && blk.versions[0].guard.checks.iter().all(|c| self.check(b, c))
-            && (blk.versions[0].prefix > 0
+            && blk.versions[0].guard.checks.iter().all(|(x, c)| match x {
+                None => self.check(c, std::ptr::null_mut()),
+                Some(x) if blk.params.contains(x) => self.check(c, self.val(*x)),
+                Some(_) => true,
+            })
+            && (!blk.versions[0].inputs.is_empty()
                 || blk.params.iter().any(|p| tffi::tensor_by_type(self.val(*p) as usize).as_ref().is_some_and(|t| t.requires_grad())))
     }
 
@@ -1034,20 +1072,9 @@ impl Act<'_> {
             };
             let ver = &blk.versions[vi];
             let code = &self.p.code[b.idx()][vi];
-            // What its origin runs on if the guard prefix misses.
-            let mut miss_params: Option<Vec<*mut PyObject>> =
-                (ver.prefix > first).then(|| blk.params.iter().map(|p| xincref(self.val(*p))).collect());
-            if miss_params.is_some() {
-                self.drop_all(&self.p.live.versions[b.idx()][vi].entry_kill);
-            }
             let fast = self.rec.is_null();
             let mut i = first;
             while i < code.steps.len() {
-                if i == ver.prefix {
-                    for p in miss_params.take().into_iter().flatten() {
-                        ffi::Py_XDECREF(p);
-                    }
-                }
                 // Steps' kill ranges are within `kills`, and instrs index
                 // values within `vals`.
                 let step = code.steps.get_unchecked(i);
@@ -1086,22 +1113,7 @@ impl Act<'_> {
                         continue 'blocks;
                     }
                     Next::Done(outcome) => return outcome,
-                    Next::Miss => {
-                        self.p.misses[b.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let params = miss_params.take().expect("a version with a guard prefix kept its params");
-                        let result = self.run_origin(b, params);
-                        match self.after_origin(b, result) {
-                            Ok(next) => {
-                                b = next;
-                                continue 'blocks;
-                            }
-                            Err(outcome) => return outcome,
-                        }
-                    }
                 }
-            }
-            for p in miss_params.take().into_iter().flatten() {
-                ffi::Py_XDECREF(p);
             }
             let edge = match &blk.term {
                 Terminator::Jump(_) => code.edges[0].as_ref(),
@@ -1188,17 +1200,7 @@ impl Act<'_> {
             (*rec).set_callee(std::ptr::null_mut());
             (*rec).at(Site::Block(b));
         }
-        // In the guard prefix, no eval breaker after a (pinned predicate)
-        // call: a signal handled there would be lost by a miss.
-        let prefix = flags & FLAG_PREFIX != 0;
-        if let Err(how) = done.and_then(|()| if callee.is_some() && !prefix { self.breaker() } else { Ok(()) }) {
-            if prefix {
-                if how != Exc::Abort {
-                    ffi::PyErr_Clear();
-                }
-                self.clear(b, vi);
-                return Next::Miss;
-            }
+        if let Err(how) = done.and_then(|()| if callee.is_some() { self.breaker() } else { Ok(()) }) {
             return match self.unwind(b, vi, i, how) {
                 Unwound::Block(h) => Next::Block(h),
                 Unwound::Outer(k, args) => Next::Done(Outcome::Outer(k, args)),
@@ -1312,21 +1314,8 @@ impl Act<'_> {
             }
             Op::Lit(i) => xincref(self.p.literals[*i as usize].as_ptr()),
             Op::Pinned(i) => xincref(self.p.pins[*i as usize].as_ptr()),
-            Op::Expect(want) => {
-                return if (a(0) == ffi::Py_True()) == *want { Ok(()) } else { Err(Exc::Abort) };
-            }
-            Op::ExpectIs(i) => {
-                return if a(0) == self.p.pins[*i as usize].as_ptr() { Ok(()) } else { Err(Exc::Abort) };
-            }
-            Op::ExpectTypeAttr { name, pin } => {
-                return if tr_type_attr_is(a(0), self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0 { Ok(()) } else { Err(Exc::Abort) };
-            }
-            Op::ExpectGetattr { name, pin } => {
-                return if tr_getattr_falls_back(a(0), self.name(*name), self.p.pins[*pin as usize].as_ptr()) != 0 { Ok(()) } else { Err(Exc::Abort) };
-            }
-            Op::ExpectCheck(c) => {
-                let x = a(0);
-                return if self.check_on(c, |_| x) { Ok(()) } else { Err(Exc::Abort) };
+            Op::Expect(_) => {
+                unreachable!("checks are lifted into guards (see cfg/guard.rs)")
             }
             Op::Autograd(t) => {
                 let params: Vec<*mut PyObject> = ins.args.iter().map(|a| self.val(*a)).collect();

@@ -47,7 +47,7 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
                 return Err(format!("bb{i}: bad or duplicate param %{}", p.0));
             }
         }
-        for v in blk.versions.iter().flat_map(|v| &v.body) {
+        for v in blk.reads.iter().chain(blk.versions.iter().flat_map(|v| &v.body)) {
             let bad = matches!(cfg[*v].op, Op::Param(_) | Op::Removed) || v.is_reserved();
             if bad || !seen.insert(*v) {
                 return Err(format!("bb{i}: bad or duplicate instr %{}", v.0));
@@ -60,19 +60,46 @@ pub fn verify(cfg: &Cfg) -> Result<(), String> {
         if blk.origin.is_none() && blk.versions.last().is_none_or(|v| !v.guard.checks.is_empty()) {
             return Err(format!("bb{i}: nothing runs when every guard fails"));
         }
-        let mut checked = blk.versions.iter().flat_map(|v| &v.guard.checks).filter_map(|c| c.param());
-        if checked.any(|p| p as usize >= blk.params.len()) {
-            return Err(format!("bb{i}: a guard checks a missing param"));
+        // Reads read params and earlier reads (and only read); a Project
+        // follows its LoadMethod or a sibling, as in a body.
+        let params: HashSet<ValueId> = blk.params.iter().copied().collect();
+        let mut reads: HashSet<ValueId> = HashSet::new();
+        let mut projected = HashSet::new();
+        for (k, r) in blk.reads.iter().enumerate() {
+            if !super::guard::guard_read(cfg, *r) {
+                return Err(format!("bb{i}: %{} can't be a guard's read", r.0));
+            }
+            if cfg[*r].args.iter().any(|a| !a.is_reserved() && !params.contains(a) && !reads.contains(a)) {
+                return Err(format!("bb{i}: read %{} reads what isn't a param or an earlier read", r.0));
+            }
+            if let Op::Project(n) = cfg[*r].op {
+                let p = cfg[*r].args[0];
+                let prev = k.checked_sub(1).map(|j| blk.reads[j]);
+                let follows = prev.is_some_and(|q| q == p || (matches!(cfg[q].op, Op::Project(_)) && cfg[q].args[0] == p));
+                if !follows || !matches!(cfg[p].op, Op::LoadMethod(_)) || n >= 2 || !projected.insert((p, n)) {
+                    return Err(format!("bb{i}: read %{} isn't a LoadMethod's projection right after it", r.0));
+                }
+            }
+            reads.insert(*r);
+        }
+        if !blk.reads.is_empty() && blk.origin.is_none() {
+            return Err(format!("bb{i}: a block with reads needs an origin"));
         }
         for v in &blk.versions {
-            if v.prefix > v.body.len() || (v.prefix > 0 && blk.origin.is_none()) {
-                return Err(format!("bb{i}: a version with a guard prefix needs an origin (and a body that long)"));
+            for (x, c) in &v.guard.checks {
+                let ok = match x {
+                    None => c.global(),
+                    Some(x) => !c.global() && (params.contains(x) || reads.contains(x)),
+                };
+                if !ok {
+                    return Err(format!("bb{i}: a guard check is on what isn't a param or a read (or a global one on a value)"));
+                }
             }
-            if let Some(x) = v.body[..v.prefix].iter().find(|x| !super::inline::is_read(cfg, **x)) {
-                return Err(format!("bb{i}: %{} in a guard prefix doesn't only read", x.0));
+            if v.inputs.iter().any(|x| !reads.contains(x)) {
+                return Err(format!("bb{i}: a body takes what isn't a read"));
             }
-            if let Some(x) = v.body[v.prefix..].iter().find(|x| super::inline::is_check(&cfg[**x].op)) {
-                return Err(format!("bb{i}: %{} checks after the guard prefix", x.0));
+            if let Some(x) = v.body.iter().find(|x| super::inline::is_check(&cfg[**x].op)) {
+                return Err(format!("bb{i}: %{} checks in a version's body", x.0));
             }
         }
         let n = blk.n_outputs();
@@ -215,7 +242,7 @@ fn check_project(cfg: &Cfg, ver: &Version, k: usize, i: u32, seen: &mut HashSet<
 // the block, or an earlier instr of the same version. Segment args must be
 // defined before the segment starts.
 fn check_locality(cfg: &Cfg, b: BlockId, ver: &Version) -> Result<(), String> {
-    let mut defined: HashSet<ValueId> = cfg[b].params.iter().copied().collect();
+    let mut defined: HashSet<ValueId> = cfg[b].params.iter().chain(&ver.inputs).copied().collect();
     let ok = |defined: &HashSet<ValueId>, v: ValueId| v.is_reserved() || defined.contains(&v);
     let mut projected = HashSet::new();
     let mut seg = 0;

@@ -1631,7 +1631,9 @@ bb1:
   %5: Tensor(f32 cpu [2]) = LoadLocal y
   jump bb2(s0=%5)
 bb2(%6 s0: Tensor(f32 cpu [2])):
-  version [guard: plain_tensor(s0), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
     %7: int 1 = Const 1
     %8: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %6, %7
         effects [1 visit]:
@@ -1714,7 +1716,9 @@ bb0:
   %0: Tensor(f32 cpu [2]) = LoadLocal x
   jump bb1(s0=%0)
 bb1(%1 s0):
-  version [guard: plain_tensor(s0), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
     Resume
     %2: int 2 = Const 2
     %3: Tensor(f32 cpu [2]) = Aten aten::mul.Tensor %1, %2
@@ -1922,7 +1926,11 @@ bb0:
   %2: int 1 = LoadLocal n
   jump bb1(s0=%0, s1=%1, s2=%2)
 bb1(%3 s0: Tensor(f32 cpu [2]), %4 s1: Tensor(f32 cpu [2]), %5 s2: int 1):
-  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard s1 is a plain tensor
+    guard type(s2) is int
     Resume
     %6: Tensor(f32 cpu [2]) = Aten aten::mul.Tensor %3, %4
     %7: Tensor(f32 cpu [2]) = Aten aten::add.Tensor %6, %5
@@ -1984,7 +1992,17 @@ bb0:
   %2 = LoadLocal n
   jump bb1(s0=%0, s1=%1, s2=%2)
 bb1(%3 s0, %4 s1, %5 s2):
-  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode, grad_enabled, no_requires_grad(s0), tensor(s0 f32 cpu [2, 3] stride [3, 1]), value(s2 == 1), no_forward_ad, no_saved_tensor_hooks]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard s1 is a plain tensor
+    guard type(s2) is int
+    guard grad enabled
+    guard not s0.requires_grad
+    guard s0 is tensor(f32 cpu [2, 3] stride [3, 1])
+    guard s2 == 1
+    guard no forward AD
+    guard no saved tensor hooks
     Resume
     %6 = Aten aten::mul.Tensor %3, %4
     %7 = Aten aten::add.Tensor %6, %5
@@ -2408,11 +2426,25 @@ bb0:
   %2 = LoadLocal n
   jump bb1(s0=%0, s1=%1, s2=%2)
 bb1(%3 s0, %4 s1, %5 s2):
-  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode, grad_enabled, requires_grad(s0), tensor(s0 f32 cpu [3] stride [1]), requires_grad(s1), tensor(s1 f32 cpu [3] stride [1]), value(s2 == 2)]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard s1 is a plain tensor
+    guard type(s2) is int
+    guard grad enabled
+    guard s0.requires_grad
+    guard s0 is tensor(f32 cpu [3] stride [1])
+    guard s1.requires_grad
+    guard s1 is tensor(f32 cpu [3] stride [1])
+    guard s2 == 2
     %6 = Autograd t0 %3, %4, %5
     %7 = Project 0 %6
     outputs [%7]
-  version [guard: plain_tensor(s0), plain_tensor(s1), int(s2), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard s1 is a plain tensor
+    guard type(s2) is int
     Resume
     %8 = Aten aten::mul.Tensor %3, %4
     %9 = Aten aten::add.Tensor %8, %5
@@ -2651,11 +2683,9 @@ t0 backward:
         x = torch.tensor([-1.0, 2.0])
         self.same(f, x)
         self.optimize_all(f)
-        self.assertIn(
-            "version [guard: pinned(m.act), plain_tensor(s0), no_torch_function_mode]",
-            torch._rust.cfg_observed(f),
-        )
-        self.assertIn("Pinned m.act", torch._rust.cfg_observed(f))
+        out = torch._rust.cfg_observed(f)
+        self.assertIn("guard m.act is torch._VariableFunctionsClass.relu", out)
+        self.assertIn("Pinned torch._VariableFunctionsClass.relu", out)
         self.assertEqual(
             torch._rust.call_with_cfg_execution(f, x), torch.tensor([0.0, 4.0])
         )
@@ -2684,10 +2714,9 @@ t0 backward:
                 f(a2, b2).sum().backward()
                 self.assertEqual((a.grad, b.grad), (a2.grad, b2.grad))
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
-            self.assertIn(
-                "pinned(torch.relu)",
-                torch._rust.cfg_observed(f).split("Autograd")[0].splitlines()[-2],
-            )
+            training = torch._rust.cfg_observed(f).split("Autograd")[0]
+            relu = "torch._VariableFunctionsClass.relu"
+            self.assertIn(f"guard torch.relu is {relu}", training)
         finally:
             torch._rust._set_cfg_autograd(False)
 
@@ -2710,7 +2739,8 @@ t0 backward:
                 f(a2, b2).sum().backward()
                 self.assertEqual((a.grad, b.grad), (a2.grad, b2.grad))
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
-            self.assertIn("pinned(F.relu)", torch._rust.cfg_observed(f))
+            out = torch._rust.cfg_observed(f)
+            self.assertIn("guard F.relu is torch.nn.functional.relu", out)
         finally:
             torch._rust._set_cfg_autograd(False)
 
@@ -2772,10 +2802,10 @@ t0 backward:
         self.assertEqual(torch._rust.call_with_cfg_execution(k, h2, 2), 20)
         self.assertEqual(torch._rust.call_with_cfg_execution(k, h1, 2), 3)
 
-    def test_guard_prefix(self):
-        # A check in a version's guard prefix that fails is a miss: the
-        # block's origin runs. A raise after the prefix unwinds from the
-        # version, with CPython's exception and traceback line.
+    def test_guard_miss_and_raise(self):
+        # A check in a version's guard that fails is a miss: the block's
+        # origin runs. A raise in the body unwinds from the version, with
+        # CPython's exception and traceback line.
         def f(x, w):
             return x @ w * 2
 
@@ -2783,7 +2813,7 @@ t0 backward:
         self.same(f, x, w)
         self.optimize_all(f)
         torch._rust._add_block_checks(f, 1, [("expect_is", 1, w)])
-        self.assertIn("-- guard prefix ends --", torch._rust.cfg_observed(f))
+        self.assertIn("guard s1 is tensor([[", torch._rust.cfg_observed(f))
         self.assertEqual(torch._rust.call_with_cfg_execution(f, x, w), f(x, w))
         self.assertEqual(torch._rust._cfg_misses(f)[1], 0)
         w2 = torch.randn(3, 3)
@@ -2802,7 +2832,7 @@ t0 backward:
     def test_elide(self):
         # A call of a Python function whose clone's path can be copied in is
         # elided: its body joins the caller's pure block, behind checks in its
-        # guard prefix that the callee and its defaults are the ones observed;
+        # guard that the callee and its defaults are the ones observed;
         # a check failing runs the block's origin (the real call).
         ns = {"torch": torch}
         exec(
@@ -2829,22 +2859,22 @@ bb0:
   %1 = LoadLocal w
   jump bb1(s0=%0, s1=%1)
 bb1(%2 s0, %3 s1):
-  version [guard: pinned(torch.relu), plain_tensor(s0), plain_tensor(s1), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard s1 is a plain tensor
+    guard helper is helper
+    guard helper.__defaults__ is __defaults__
+    guard torch.relu is torch._VariableFunctionsClass.relu
+    %4 = Pinned torch._VariableFunctionsClass.relu
     Resume
-    %4 = LoadGlobal helper
-    ExpectIs helper %4
-    %5 = Pinned helper
-    %6 = LoadAttr __defaults__ %5
-    ExpectIs __defaults__ %6
-    %7 = Pinned 2
-    %8 = Pinned torch.relu
+    %5 = Aten aten::matmul %2, %3
+    %6 = Pinned 2
+    %7 = Call 1 null, %4, %5
+    %8 = Aten aten::mul.Tensor %7, %6
     %9 = Const 1
-    -- guard prefix ends --
-    %10 = Aten aten::matmul %2, %3
-    %11 = Call 1 null, %8, %10
-    %12 = Aten aten::mul.Tensor %11, %7
-    %13 = Aten aten::add.Tensor %12, %9
-    outputs [%13]
+    %10 = Aten aten::add.Tensor %8, %9
+    outputs [%10]
   jump bb2(s0=o0)
   """,
         )
@@ -2885,6 +2915,22 @@ bb1(%2 s0, %3 s1):
         finally:
             torch._rust._set_cfg_elide(False)
 
+    def test_elide_kwargs_dicts(self):
+        # Each elided call's **kwargs is its own dict: guards share reads,
+        # but an empty dict is a new object, not a read.
+        ns = {"torch": torch}
+        exec(
+            "def helper(t, **kw):\n    return t * 2, kw\n\n"
+            "def f(x):\n    return helper(x), helper(x)\n",
+            ns,
+        )
+        f = ns["f"]
+        x = torch.randn(3)
+        self.elide(f, x)
+        self.assertIn("BUILD_MAP", torch._rust.cfg_observed(f, False, False))
+        (_, a), (_, b) = torch._rust.call_with_cfg_execution(f, x)
+        self.assertIsNot(a, b)
+
     def test_elide_try(self):
         # A callee path inside a try isn't elided: a raise in the copy would
         # go to the call's handler, past the callee's except.
@@ -2901,9 +2947,9 @@ bb1(%2 s0, %3 s1):
         self.assertEqual(torch._rust.call_with_cfg_execution(f, b), False)
 
     def test_elide_autograd(self):
-        # An elided block trains: its training version runs the guard prefix,
-        # then its node's forward on the params and what the prefix read; a
-        # tensor read there (W) gets checks in the prefix and its gradient.
+        # An elided block trains: its training version checks its guard,
+        # then runs its node's forward on the params and its inputs; a tensor
+        # input (W) gets checks in the guard and its gradient.
         ns = {"torch": torch, "W": torch.randn(3, 3, requires_grad=True)}
         exec(
             "def helper(t):\n    return torch.relu(t @ W)\n\n"
@@ -2923,14 +2969,13 @@ bb1(%2 s0, %3 s1):
                 self.assertEqual(got, W.grad)
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
             training = torch._rust.cfg_observed(f, False, False).split("Autograd")[0]
-            self.assertIn(
-                "ExpectCheck tensor(_ f32 cpu [3, 3] stride [3, 1])", training
-            )
-            # A W of another shape fails the check: the origin runs.
+            self.assertIn("guard W is tensor(f32 cpu [3, 3] stride [3, 1])", training)
+            # A W of another shape fails the training version's check: the
+            # plain version runs (no miss).
             ns["W"] = torch.randn(3, 2, requires_grad=True)
             misses = torch._rust._cfg_misses(f)[1]
             self.assertEqual(torch._rust.call_with_cfg_execution(f, x), f(x))
-            self.assertEqual(torch._rust._cfg_misses(f)[1], misses + 1)
+            self.assertEqual(torch._rust._cfg_misses(f)[1], misses)
         finally:
             torch._rust._set_cfg_autograd(False)
 
@@ -2949,7 +2994,7 @@ bb1(%2 s0, %3 s1):
             return t.m()
 
         self.elide(f, T())
-        self.assertIn("ExpectIs", torch._rust.cfg_observed(f, False, False))
+        self.assertIn("guard s0 is ", torch._rust.cfg_observed(f, False, False))
         self.assertEqual(torch._rust.call_with_cfg_execution(f, U()), 2)
         self.assertEqual(torch._rust._cfg_misses(f)[1], 1)
 
@@ -2976,20 +3021,17 @@ bb1(%2 s0, %3 s1):
             """\
 bb0:
   version:
+    guard type(a) is bool
+    guard bool(a)
     Resume
     %0 = LoadGlobal foo
-    %1 = LoadLocal a
-    ExpectCheck bool(_) %1
-    %2 = ToBool %1
-    Expect True %2
-    %3 = Const None
-    -- guard prefix ends --
-    %4 = Call 0 null, %0
-    %5 = LoadGlobal bar
-    %6 = Call 0 null, %5
-    %7 = LoadGlobal bay
-    %8 = Call 0 null, %7
-    outputs [%3]
+    %1 = Call 0 null, %0
+    %2 = LoadGlobal bar
+    %3 = Call 0 null, %2
+    %4 = LoadGlobal bay
+    %5 = Call 0 null, %4
+    %6 = Const None
+    outputs [%6]
   return o0
   """,
         )
@@ -3005,7 +3047,7 @@ bb0:
 
     def test_specialize_compare(self):
         # A compare of values always seen exact builtins (each checked) runs
-        # no Python code, so it moves ahead of foo into the guard prefix.
+        # no Python code, so it moves ahead of foo into the guard.
         log = []
         ns = {"log": log}
         exec(
@@ -3019,10 +3061,9 @@ bb0:
         torch._rust.call_with_cfg_execution(f, 3, "y")
         torch._rust._specialize(f, 0)
         out = torch._rust.cfg_observed(f, False, False).split("origin:")[0]
-        prefix = out.split("-- guard prefix ends --")[0]
-        self.assertIn("ExpectCheck int(_)", prefix)
-        self.assertIn("ExpectCheck str(_)", prefix)
-        self.assertEqual(prefix.count("CompareOp"), 2)
+        for check in ("type(n) is int", "n == 3", "type(s) is str", "s != 'x'"):
+            self.assertIn(f"guard {check}\n", out)
+        self.assertNotIn("CompareOp", out)
         for args, want in (
             ((3, "y"), ["foo", "bar"]),
             ((4, "y"), ["foo", "baz"]),
@@ -3066,7 +3107,7 @@ bb0:
             torch._rust.call_with_cfg_execution(fn, *warm)
             torch._rust._specialize(fn, 0)
             shown = torch._rust.cfg_observed(fn, False, False)
-            self.assertIn("-- guard prefix ends --", shown)
+            self.assertIn("guard ", shown)
             for args in cases:
                 self.assertEqual(
                     torch._rust.call_with_cfg_execution(fn, *args), fn(*args)
@@ -3169,11 +3210,11 @@ bb0:
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
             out = torch._rust.cfg_observed(f, False, False).split("origin:")[0]
             self.assertIn(
-                "ExpectTypeAttr __call__ torch.nn.modules.module.Module._wrapped_call_impl",
+                "guard type(s0).__call__ is torch.nn.modules.module.Module._wrapped_call_impl",
                 out,
             )
             self.assertIn(
-                "ExpectGetattr weight torch.nn.modules.module.Module.__getattr__", out
+                ".weight falls back to torch.nn.modules.module.Module.__getattr__", out
             )
             self.assertIn("Autograd", out)
             seen = []
@@ -3192,7 +3233,7 @@ bb0:
 
     def test_elide_config_branch(self):
         # A branch on Python config (a compare of attribute reads) is checked
-        # in the guard prefix, so the module call is elided and trains; when
+        # in the guard, so the module call is elided and trains; when
         # the config changes, the check fails and the real call runs.
         class M(torch.nn.Module):
             def __init__(self):
@@ -3220,8 +3261,8 @@ bb0:
                 torch._rust.call_with_cfg_execution(f, x).sum().backward()
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
             out = torch._rust.cfg_observed(f, False, False)
-            prefix = out.split("-- guard prefix ends --")[0]
-            self.assertIn("CompareOp ==", prefix)
+            self.assertIn(".act == 'relu'\n", out)
+            self.assertNotIn("CompareOp", out)
             misses = torch._rust._cfg_misses(f)[1]
             m.act = "gelu"
             self.assertEqual(torch._rust.call_with_cfg_execution(f, x), F.gelu(m.fc(x)))
@@ -3289,7 +3330,7 @@ bb0:
                 out.sum().backward()
                 self.assertEqual(a.grad, torch.full((2, 3), 2.0))
             self.assertEqual(torch._rust._cfg_autograd_blocks(f), [(1, 0, "trained")])
-            self.assertIn("value(s1 == (3, 2))", torch._rust.cfg_observed(f))
+            self.assertIn("guard s1 == (3, 2)", torch._rust.cfg_observed(f))
         finally:
             torch._rust._set_cfg_autograd(False)
 
@@ -3352,6 +3393,25 @@ bb0:
                 run(f, x, rm, rv, torch.randn(2, 2))
         self.assertEqual(stats[0], stats[1])
 
+    def test_guard_read_after_write(self):
+        # A callee loaded before anything writes is pinned, its load checked
+        # in the guard; one loaded after a write (here deleting an item)
+        # isn't, since that check couldn't run on entry, and its call stays
+        # a call. The read after the write sees it.
+        def f(lst, x):
+            y = torch.relu(x)
+            del lst[0]
+            return torch.neg(y), lst[0]
+
+        x = torch.randn(2)
+        torch._rust.call_with_cfg_execution(f, [1, 2, 3], x)
+        self.optimize_all(f)
+        out = torch._rust.cfg_observed(f, False, False).split("origin:")[0]
+        self.assertIn("guard torch.relu is", out)
+        self.assertNotIn("guard torch.neg is", out)
+        y, second = torch._rust.call_with_cfg_execution(f, [1, 2, 3], x)
+        self.assertEqual((y, second), (torch.neg(torch.relu(x)), 2))
+
     def test_raise_repeats_no_rng(self):
         # A random op before a raise draws once, as CPython does.
         def f(z):
@@ -3359,7 +3419,8 @@ bb0:
 
         torch._rust.call_with_cfg_execution(f, torch.randn(3))
         self.optimize_all(f)
-        self.assertIn("Pinned torch.rand", torch._rust.cfg_observed(f, False, False))
+        out = torch._rust.cfg_observed(f, False, False)
+        self.assertIn("Pinned torch._VariableFunctionsClass.rand", out)
         after = []
         for run in (torch._rust.call_with_cfg_execution, lambda g, *a: g(*a)):
             torch.manual_seed(0)
@@ -3396,12 +3457,13 @@ bb0:
   %0: int 1 = LoadLocal x
   jump bb1(s0=%0)
 bb1(%1 s0: int 1):
-  Resume
-  %2: int 1 = Const 1
-  %3: int 2 = BinaryOp + %1, %2
-  %4: builtin_function_or_method = LoadGlobal locals
-  jump bb2(s0=%3, s1=%4)
-  unwind [3..4) -> bb6(s0=%3)
+  version:
+    %2 = input locals
+    Resume
+    %3: int 1 = Const 1
+    %4: int 2 = BinaryOp + %1, %3
+    outputs [%4, %2]
+  jump bb2(s0=o0, s1=o1)
 """,
         )
         self.same(g, torch.ones(2))
@@ -3416,18 +3478,21 @@ bb0:
   %0 = LoadLocal x
   jump bb1(s0=%0)
 bb1(%1 s0):
-  version [guard: pinned(torch.relu), plain_tensor(s0), no_torch_function_mode]:
+  version:
+    guard no torch function mode
+    guard s0 is a plain tensor
+    guard torch.relu is torch._VariableFunctionsClass.relu
+    %2 = Pinned torch._VariableFunctionsClass.relu
     Resume
-    %2 = Const 1
-    %3 = Aten aten::add.Tensor %1, %2
-    %4 = Pinned torch.relu
-    %5 = Call 1 null, %4, %3
+    %3 = Const 1
+    %4 = Aten aten::add.Tensor %1, %3
+    %5 = Call 1 null, %2, %4
     %6 = LoadMethod neg %5
     %7 = Project 0 %6
     %8 = Project 1 %6
     %9 = Call 0 %7, %8
     outputs [%9]
-    unwind [3..5) -> bb3(s0=%3)
+    unwind [4..5) -> bb3(s0=%4)
     unwind [5..9) -> bb4(s0=%5)
   jump bb2(s0=o0)
   origin:

@@ -170,41 +170,6 @@ PyObject* tr_load_global(_PyInterpreterFrame* f, int namei, tr_global_cache* c) 
   return v;
 }
 
-// What co_names[global] resolves to in f's globals (then builtins), then
-// each co_names[attrs[i]] in turn through a module's __dict__ (borrowed), or
-// NULL (no error set) if something isn't there or isn't a plain dict or
-// module. Runs no Python code.
-// names[0] in globals (NULL: f's), then builtins, then names[1..n] each in
-// the module before's __dict__.
-PyObject* tr_resolve_pin(
-    _PyInterpreterFrame* f,
-    PyObject* globals,
-    PyObject* builtins,
-    PyObject* const* names,
-    Py_ssize_t n) {
-  if (globals == NULL) {
-    globals = f->f_globals;
-    builtins = f->f_builtins;
-  }
-  if (!PyDict_CheckExact(globals) || !PyDict_CheckExact(builtins)) {
-    return NULL;
-  }
-  PyObject* v = PyDict_GetItemWithError(globals, names[0]);
-  if (v == NULL && !PyErr_Occurred()) {
-    v = PyDict_GetItemWithError(builtins, names[0]);
-  }
-  for (Py_ssize_t i = 1; v != NULL && i < n; i++) {
-    if (!PyModule_CheckExact(v)) {
-      return NULL;
-    }
-    v = PyDict_GetItemWithError(PyModule_GetDict(v), names[i]);
-  }
-  if (v == NULL) {
-    PyErr_Clear();
-  }
-  return v;
-}
-
 // Method-form LOAD_ATTR: (owner -- meth|NULL, self|attr).
 int tr_load_method(PyObject* name, PyObject* owner, PyObject** out) {
   PyObject* meth = NULL;

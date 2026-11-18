@@ -1,7 +1,7 @@
 // Specialization: replaces a region whose branches each went one way when
 // observed with one block whose version runs the path taken. Each branch
-// becomes an Expect in the version's guard prefix (see Version::prefix), so
-// its condition must be known on entry: computed from the frame's locals and
+// becomes a check in the version's guard (see guard.rs), so its condition
+// must be known on entry: computed from the frame's locals and
 // what reads can be moved ahead of the region's other code. A failing check
 // runs the block's origin, a copy of the whole region, from its start.
 //
@@ -142,8 +142,8 @@ fn leave(cfg: &Cfg, x: BlockId, e: &Exit) -> Exit {
     Exit::Leave(used(cfg, x).iter().map(|u| have[want.iter().position(|w| w == u).unwrap()]).collect())
 }
 
-// Whether it built the region (false: a check didn't make it into the guard
-// prefix).
+// Whether it built the region (false: a check didn't make it into the
+// guard).
 fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<BlockId, bool>, exact: &HashMap<ValueId, Vec<Check>>) -> bool {
     let head = path[0];
     let x = *path.last().unwrap();
@@ -174,7 +174,7 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
             let args: Vec<ValueId> = cfg[*v].args.iter().map(|a| get(&subst, *a)).collect();
             cfg[*v].args = args.clone();
             for (c, a) in exact.get(v).into_iter().flatten().zip(&args) {
-                let check = cfg.add(Op::ExpectCheck(Box::new(c.clone())), vec![*a], cfg[*v].origin);
+                let check = cfg.add(Op::expect(c.clone()), vec![*a], cfg[*v].origin);
                 merged.body.push(check);
             }
             let handler = match ver.handler_at(k) {
@@ -193,7 +193,7 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
             Terminator::Jump(Exit::Block(e)) => e,
             Terminator::Branch { cond, then, else_ } => {
                 let d = dirs[b];
-                let check = cfg.add(Op::Expect(d), vec![outputs[*cond as usize]], blk.term_origin);
+                let check = cfg.add(Op::expect(Check::Value(Lit::Bool(d))), vec![outputs[*cond as usize]], blk.term_origin);
                 merged.body.push(check);
                 match if d { then } else { else_ } {
                     Exit::Block(e) => e,
@@ -233,11 +233,11 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
     blk.handlers = handlers;
     blk.origin = Some(Arc::new(origin));
 
-    // Reads move into the guard prefix unless what ran before them may have
-    // changed what they read: a local stored (or deleted) before, or any
-    // other read after code that can run Python (a call, an operator).
+    // Reads move into the guard unless what ran before them may have changed
+    // what they read: a local stored (or deleted) before, or any other read
+    // after code that can run Python (a call, an operator).
     let (mut written, mut all_written, mut opaque) = (HashSet::new(), false, false);
-    super::inline::hoist_reads(cfg, head, |cfg, x| {
+    let ok = super::guard::lift_guard(cfg, head, |cfg, x| {
         let stale = match cfg[x].op {
             Op::LoadLocal { slot } => all_written || written.contains(&slot),
             Op::ToBool | Op::Compare(_) => opaque && !exact.contains_key(&x),
@@ -253,10 +253,7 @@ fn build(cfg: &mut Cfg, path: &[BlockId], region: &[BlockId], dirs: &HashMap<Blo
         }
         opaque |= stale || !super::inline::is_read(cfg, x);
         stale
-    });
-    cfg[head].versions[0].set_unwind(|v| raises_to.get(&v).cloned().unwrap_or(Handler::Propagate));
-    let ok = super::inline::checks_in_prefix(cfg, head);
-    cfg.normalize_unwind(head);
+    }, |v| raises_to.get(&v).cloned().unwrap_or(Handler::Propagate));
     ok
 }
 

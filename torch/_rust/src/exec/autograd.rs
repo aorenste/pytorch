@@ -54,8 +54,8 @@ pub fn enabled() -> bool {
 
 // Why block b may not get its own node, if it may not. It may when it's a
 // pure block (it has an origin to bootstrap from) whose only version runs
-// aten ops and nothing that could read or change other state, after its
-// read prefix if it has one.
+// aten ops and nothing that could read or change other state (what it reads
+// is in its guard, see cfg/guard.rs).
 pub fn ineligible(cfg: &Cfg, b: BlockId) -> Option<String> {
     let blk = &cfg[b];
     if blk.origin.is_none() {
@@ -76,7 +76,7 @@ pub fn ineligible(cfg: &Cfg, b: BlockId) -> Option<String> {
             Op::Aten { .. } | Op::Const(_) | Op::Lit(_) | Op::Project(_) | Op::BuildTuple(_) | Op::Resume | Op::Null | Op::Pinned(_)
         ) || pinned_call(v)
     };
-    let compute = &ver.body[ver.prefix..];
+    let compute = &ver.body;
     if let Some(v) = compute.iter().find(|v| !allowed(**v)) {
         let op = format!("{:?}", cfg[*v].op);
         return Some(format!("runs {}", op.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("?")));
@@ -132,7 +132,7 @@ struct Run {
 
 struct Site {
     // What the trace depends on.
-    checks: Vec<Check>,
+    checks: Vec<(Option<u32>, Check)>,
     tensor_params: Vec<u32>,
     // How the block's outputs are made from its params and tensor outputs.
     outputs: Vec<Template>,
@@ -430,7 +430,7 @@ impl Bootstrap {
         let py = Python::assume_attached();
         let (mut inputs, mut tensors, mut copies, mut copied, mut call) = (vec![], vec![], vec![], vec![], vec![]);
         refuse_unsupported()?;
-        let mut checks = vec![Check::GradEnabled(true)];
+        let mut checks = vec![(None, Check::GradEnabled(true))];
         let mut untrainable: Option<String> = None;
         let mut tensor_params = vec![];
         for (i, p) in params.iter().enumerate() {
@@ -454,10 +454,10 @@ impl Bootstrap {
                 if !m.strided {
                     untrainable.get_or_insert_with(|| format!("tensor param {i} has no fixed shape and strides"));
                 }
-                checks.push(Check::RequiresGrad(i as u32, rg));
+                checks.push((Some(i as u32), Check::RequiresGrad(rg)));
                 let (sizes, strides) = (m.sizes.clone(), if m.strided { t.strides().to_vec() } else { vec![] });
                 let spec = TensorSpec { dtype: m.dtype, device_type: m.device_type, device_index: m.device_index, sizes, strides };
-                checks.push(Check::TensorMeta(i as u32, Box::new(spec)));
+                checks.push((Some(i as u32), Check::TensorMeta(Box::new(spec))));
                 if rg {
                     let c = obj.call_method0("detach")?.call_method0("requires_grad_")?;
                     copies.push(tensors.len());
@@ -474,9 +474,9 @@ impl Bootstrap {
                     items.iter().map(|x| x.is_exact_instance_of::<pyo3::types::PyInt>().then(|| x.extract().ok()).flatten()).collect()
                 };
                 match super::lit(&obj) {
-                    Some(l) => checks.push(Check::Value(i as u32, l)),
+                    Some(l) => checks.push((Some(i as u32), Check::Value(l))),
                     None if tuple || obj.is_exact_instance_of::<PyList>() => match ints() {
-                        Some(ns) => checks.push(Check::Ints(i as u32, tuple, ns)),
+                        Some(ns) => checks.push((Some(i as u32), Check::Ints(tuple, ns))),
                         None => {
                             let tp = obj.get_type().name().map_or("?".into(), |n| n.to_string());
                             untrainable.get_or_insert_with(|| format!("param {i} is a {tp} of more than ints"));
